@@ -1,0 +1,63 @@
+SHELLY + PVPC MULTIZONA
+
+Zonas incluidas:
+- principal: Shelly Pro EM-50, 192.168.4.175
+- acuario: Shelly PM Mini Gen 3, 192.168.4.203
+- schneider: Schneider PowerLogic PM710 mediante conversor USR-W610/PUSR, 192.168.100.206:502, Modbus TCP, Slave ID 1 (solo lectura)
+
+Cada zona guarda su propio histórico en SQLite:
+- principal -> shelly.db (mantiene el histórico existente)
+- acuario -> acuario.db
+
+La aplicación comparte los precios PVPC horarios, pero muestra consumo, potencia, energía acumulada,
+coste energético y CSV por separado para cada zona. En la web usa el selector de zona.
+
+Instalación:
+1. Detén la versión anterior.
+2. Extrae el ZIP en una carpeta nueva.
+3. Ejecuta INSTALAR_Y_ARRANCAR.bat.
+4. Abre http://127.0.0.1:5000.
+
+Para conservar datos, copia shelly.db y config.json de la instalación anterior a esta carpeta.
+El programa crea acuario.db automáticamente. El Shelly PM Mini Gen 3 se lee mediante PM1.GetStatus (no Switch.GetStatus, porque es un medidor sin relé).
+La estimación de factura sigue usando los ajustes globales configurados en Ajustes.
+
+CORRECCIÓN ACUARIO:
+El PM Mini Gen 3 expone las medidas a través del componente RPC PM1.
+Esta versión usa PM1.GetStatus?id=0 en vez de Switch.GetStatus?id=0.
+
+VERIFICACIÓN REAL DEL ACUARIO:
+Se ha comprobado con la salida del equipo S3PM-001PCEU16 (firmware 1.7.5):
+PM1.GetStatus?id=0 devuelve voltage, current, apower, freq, aenergy.total
+y ret_aenergy.total. La energía total se convierte de Wh a kWh.
+Este dispositivo no devuelve necesariamente potencia aparente ni factor de
+potencia en ese endpoint; esos campos pueden aparecer vacíos sin que sea un error.
+
+GRÁFICAS INCLUIDAS:
+- Potencia (W) y PVPC (€/kWh) en el mismo gráfico con dos escalas.
+- Consumo diario en barras para los últimos 14 días con datos.
+- Consumo por hora en barras para el día actual.
+- Coste acumulado del mes, que ya estaba disponible.
+Las barras se calculan a partir de los incrementos del contador registrados
+por la aplicación; el histórico comienza desde que la aplicación recoge datos.
+
+ACCESO DESDE OTROS EQUIPOS DE LA RED:
+1. Ejecuta la aplicación en el ordenador servidor.
+2. Si Windows bloquea las conexiones, ejecuta ABRIR_FIREWALL.bat como administrador.
+3. En el ordenador servidor, abre CMD y ejecuta: ipconfig
+4. Busca la dirección IPv4 del adaptador conectado a tu red local.
+5. Desde los otros equipos abre http://IP_DEL_SERVIDOR:5000 (sustituye la IP).
+El servidor escucha ahora en 0.0.0.0 para aceptar conexiones de red. Usa una
+red privada y de confianza; no publiques el puerto 5000 directamente en Internet.
+Si la IP del servidor cambia, usa la nueva IP o configura una reserva DHCP en el router.
+
+
+INTEGRACIÓN SCHNEIDER POWERLOGIC PM710:
+- Selecciona “Schneider PowerLogic PM710” en el selector de zona.
+- Conexión: Modbus TCP al conversor 192.168.100.206, puerto 502, Slave ID 1.
+- La aplicación realiza exclusivamente lecturas Modbus FC03 (Holding Registers); no escribe parámetros en el contador.
+- Lee registros directos de coma flotante para energía activa total (1000), potencia activa total (1006), factor de potencia (1012), tensión media entre fases (1014), corriente media (1018) y frecuencia (1020). La dirección PDU usada por Modbus es el número de registro documental menos uno.
+- El histórico se guarda separado en schneider.db. Los históricos Shelly existentes permanecen en shelly.db y acuario.db.
+- Instala la dependencia nueva con el entorno de Python de esta aplicación: pip install -r requirements.txt.
+- Requisito de red: el ordenador que ejecuta esta aplicación debe poder alcanzar 192.168.100.206:502. Si está en otra subred, comprueba las rutas/VLAN y que el conversor acepte conexiones Modbus TCP.
+- La decodificación usa el formato IEEE-754 de 32 bits con orden de registros alto-bajo. Antes de confiar en las cifras, compara tensión, potencia, corriente y energía con la pantalla/lectura del contador; si aparecen valores absurdos, puede variar el orden de palabras o el mapa configurado en el conversor.

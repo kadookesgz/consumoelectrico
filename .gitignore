@@ -1,0 +1,12 @@
+# Datos locales: históricos de cada zona y ajustes con el token de ESIOS
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+config.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
