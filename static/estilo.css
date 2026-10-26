@@ -1,0 +1,39 @@
+*{box-sizing:border-box}
+body{margin:0;background:#0b1220;color:#edf4ff;font:15px system-ui,Arial}
+main{max-width:1200px;margin:auto;padding:22px}
+header{display:flex;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:20px}
+h1{margin:0 0 6px;font-size:clamp(24px,4vw,34px)}
+h2{font-size:18px;margin-top:0}
+p,.muted{color:#9aabc4}
+a{color:#54d6a0}
+nav{display:flex;gap:14px;flex-wrap:wrap;margin-bottom:14px;font-size:14px}
+.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}
+.card{background:#121d30;border:1px solid #25334b;border-radius:16px;padding:18px;min-width:0}
+.label{color:#9aabc4;font-size:13px}
+.value{font-size:clamp(22px,3vw,32px);font-weight:700;margin-top:8px}
+.unit{font-size:14px;color:#9aabc4}
+.small{font-size:12px;color:#9aabc4;margin-top:8px}
+.full{grid-column:1/-1}
+.chart{height:290px}
+table{width:100%;border-collapse:collapse}
+td,th{text-align:left;padding:7px 8px;border-bottom:1px solid #25334b;white-space:nowrap}
+th{color:#9aabc4;font-weight:600}
+.status{overflow-wrap:anywhere;border:1px solid #25334b;border-radius:25px;padding:8px 12px;color:#9aabc4;align-self:start}
+button,.button{background:#23644f;border:0;color:white;border-radius:9px;padding:9px 13px;cursor:pointer;font:inherit;text-decoration:none;display:inline-block}
+button.alt{background:#1d2a40;border:1px solid #344761}
+select,input{padding:9px;border-radius:8px;background:#0b1220;color:#edf4ff;border:1px solid #344761;font:inherit}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:end}
+.row label{display:flex;flex-direction:column;gap:4px;font-size:13px;color:#9aabc4}
+.warn{color:#ffd479}
+.bad{color:#ff8a8a}
+.good{color:#54d6a0}
+.alerts{display:flex;flex-direction:column;gap:8px;margin-bottom:14px}
+.alert{overflow-wrap:anywhere;background:#2a2414;border:1px solid #5c4a1c;border-radius:12px;padding:10px 14px;color:#ffe2a0}
+.alert.info{background:#13233a;border-color:#2b4466;color:#cfe2ff}
+.alert.done{opacity:.6}
+.alert .when{font-size:12px;color:#9aabc4;margin-right:8px}
+.banner{background:#3a1d1d;border:1px solid #6b2f2f;border-radius:12px;padding:10px 14px;margin-bottom:14px;color:#ffc9c9}
+.delta-up{color:#ff8a8a}.delta-down{color:#54d6a0}
+@media(max-width:760px){main{padding:12px}.grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+.wide{grid-column:span 2}
+@media(max-width:430px){.grid{grid-template-columns:minmax(0,1fr)}.full,.wide{grid-column:auto}}

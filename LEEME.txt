@@ -1,5 +1,26 @@
 SHELLY + PVPC MULTIZONA
 
+NOVEDADES DE ESTA VERSIÓN
+- Precios PVPC completos: se guardan también los de mañana (a partir de las 20:15) y la hora
+  repetida del cambio horario. Si faltan precios de días pasados, se descargan solos y se
+  recalcula el coste de esas horas.
+- Resumen por horas: consumo, coste y potencia media/máxima se guardan por horas, así que el
+  monitor y el histórico no se vuelven lentos con el tiempo. La primera vez que arranca, la
+  aplicación genera ese resumen a partir de las lecturas existentes (puede tardar un minuto).
+- Las lecturas de 5 s se pueden borrar pasado un tiempo (Ajustes → Histórico). Por defecto se
+  conservan todas.
+- Factura por zona: el término de potencia, el alquiler del contador y los fijos solo se suman
+  en las zonas marcadas como «Paga término fijo» (por defecto, la principal).
+- Huecos: si la aplicación estuvo parada, el consumo de ese periodo se reparte entre sus horas.
+- Ajustes con contraseña. El token de ESIOS ya no se muestra en la página.
+- Arranque automático con Windows: INICIO_AUTOMATICO_ACTIVAR.bat (y _QUITAR.bat para quitarlo).
+- Avisos en el monitor y, opcionalmente, por Telegram: medidor sin responder, consumo por encima
+  de un límite durante unos minutos y horas más baratas de mañana.
+- Histórico: comparación con el periodo anterior y reparto del consumo entre zonas.
+- Equipos configurables desde Ajustes → Equipos: nombre, modelo, IP, puerto, avisos y qué zona
+  está dentro de otra. Se pueden añadir medidores sin tocar el código.
+- Chart.js va incluido en la carpeta static: las gráficas funcionan sin Internet.
+
 Zonas incluidas:
 - principal: Shelly Pro EM-50, 192.168.4.175
 - acuario: Shelly PM Mini Gen 3, 192.168.4.203
@@ -18,8 +39,9 @@ Instalación:
 3. Ejecuta INSTALAR_Y_ARRANCAR.bat.
 4. Abre http://127.0.0.1:5000.
 
-Para conservar datos, copia shelly.db y config.json de la instalación anterior a esta carpeta.
-El programa crea acuario.db automáticamente. El Shelly PM Mini Gen 3 se lee mediante PM1.GetStatus (no Switch.GetStatus, porque es un medidor sin relé).
+Para conservar datos, copia todos los .db (shelly.db, acuario.db, schneider.db...) y config.json
+de la instalación anterior a esta carpeta. El programa crea las bases de datos que falten.
+La aplicación necesita las carpetas templates y static junto a shelly_pvpc_web.py. El Shelly PM Mini Gen 3 se lee mediante PM1.GetStatus (no Switch.GetStatus, porque es un medidor sin relé).
 La estimación de factura sigue usando los ajustes globales configurados en Ajustes.
 
 CORRECCIÓN ACUARIO:
@@ -54,6 +76,7 @@ Si la IP del servidor cambia, usa la nueva IP o configura una reserva DHCP en el
 
 INTEGRACIÓN SCHNEIDER POWERLOGIC PM710:
 - Selecciona “Schneider PowerLogic PM710” en el selector de zona.
+- En Ajustes → Equipos puedes elegir la tensión fase-fase (registro 1014) o fase-neutro (1016).
 - Conexión: Modbus TCP al conversor 192.168.100.206, puerto 502, Slave ID 1.
 - La aplicación realiza exclusivamente lecturas Modbus FC03 (Holding Registers); no escribe parámetros en el contador.
 - Lee registros directos de coma flotante para energía activa total (1000), potencia activa total (1006), factor de potencia (1012), tensión media entre fases (1014), corriente media (1018) y frecuencia (1020). La dirección PDU usada por Modbus es el número de registro documental menos uno.
@@ -72,3 +95,24 @@ CONSULTA DEL HISTÓRICO:
 - Se puede descargar en CSV tanto el detalle agrupado como las lecturas originales del periodo.
 - La dirección de la página guarda la consulta, así que puedes guardarla en favoritos o compartirla dentro de la red.
 - Solo lee las bases de datos existentes: no modifica ni borra el histórico.
+
+
+ARRANQUE AUTOMÁTICO CON WINDOWS:
+1. Ejecuta INSTALAR_Y_ARRANCAR.bat una vez para instalar las dependencias y ciérralo.
+2. Ejecuta INICIO_AUTOMATICO_ACTIVAR.bat (pide permisos de administrador).
+   Crea la tarea «Monitor consumo electrico», que arranca el programa al encender el ordenador,
+   sin ventana y sin iniciar sesión, y lo reinicia si se cierra por un error.
+3. Los mensajes del programa se guardan en app.log, en esta carpeta.
+Para quitarlo, ejecuta INICIO_AUTOMATICO_QUITAR.bat. No abras a la vez INSTALAR_Y_ARRANCAR.bat,
+porque las dos copias intentarían usar el puerto 5000.
+Si mueves la carpeta, vuelve a ejecutar INICIO_AUTOMATICO_ACTIVAR.bat.
+
+AVISOS POR TELEGRAM:
+1. En Telegram, habla con @BotFather, crea un bot (/newbot) y copia su token.
+2. Escribe cualquier mensaje a tu bot nuevo.
+3. Consulta tu chat ID con @userinfobot.
+4. Pon el token y el chat ID en Ajustes → Avisos, guarda y pulsa «Enviar mensaje de prueba».
+
+CONTRASEÑA:
+Se pone en Ajustes → Seguridad. Si la olvidas, borra la línea admin_password_hash de
+config.json y reinicia la aplicación.

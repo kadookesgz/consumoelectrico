@@ -1,0 +1,99 @@
+<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Ajustes</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='estilo.css') }}">
+<style>
+main{max-width:1100px}.card{margin-bottom:16px}h1{margin-top:0}
+.form label{display:block;color:#b5c4d9;font-size:13px;margin:14px 0 5px}.form input:not([type=checkbox]),.form select{width:100%}
+.cols{display:grid;grid-template-columns:1fr 1fr;gap:0 14px}.hint{color:#9aabc4;font-size:13px;line-height:1.5}.msg{color:#ffd479}
+fieldset.zone{border:1px solid #25334b;border-radius:12px;padding:6px 14px 14px;margin:0 0 12px}fieldset.zone legend{padding:0 6px;font-weight:600}
+.zgrid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:0 12px}.zgrid .span2{grid-column:span 2}
+@media(max-width:900px){.zgrid{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:430px){.zgrid{grid-template-columns:minmax(0,1fr)}.zgrid .span2{grid-column:auto}}
+.check{display:flex!important;flex-direction:row!important;gap:8px;align-items:center;color:#edf4ff!important;font-size:14px!important}
+.save{position:sticky;bottom:0;background:#0b1220ee;padding:12px 0;display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+@media(max-width:600px){.cols{grid-template-columns:1fr}}
+</style></head><body><main>
+<p><a href="/">← Volver al monitor</a>{% if is_admin and has_password %} · <a href="/salir">Cerrar sesión</a>{% endif %}</p>
+<h1>Ajustes</h1>
+{% with messages = get_flashed_messages() %}{% if messages %}{% for m in messages %}<p class="msg">{{ m }}</p>{% endfor %}{% endif %}{% endwith %}
+<form method="post" class="form">
+
+<section class="card"><h2>Tarifa PVPC</h2>
+<p class="hint">Los precios horarios se consultan en REE/ESIOS (indicador PVPC 2.0TD, Península). El token personal de ESIOS es opcional para el PVPC básico y se guarda solo en este ordenador, en config.json.</p>
+<label>Token personal ESIOS</label><input name="esios_token" type="password" autocomplete="off" placeholder="{{ 'Guardado. Déjalo vacío para mantenerlo' if cfg.esios_token else 'Pega aquí tu token de ESIOS (opcional)' }}">
+{% if cfg.esios_token %}<label class="check"><input type="checkbox" name="esios_token_delete" value="1"> Borrar el token guardado</label>{% endif %}
+<div class="cols">
+<div><label>Potencia contratada P1 (kW)</label><input name="power_kw_p1" type="number" step="0.01" value="{{ cfg.power_kw_p1 }}"></div>
+<div><label>Potencia contratada P2 (kW)</label><input name="power_kw_p2" type="number" step="0.01" value="{{ cfg.power_kw_p2 }}"></div>
+<div><label>Precio potencia P1 (€/kW/día, según factura)</label><input name="power_price_p1_eur_kw_day" type="number" step="0.000001" value="{{ cfg.power_price_p1_eur_kw_day }}"></div>
+<div><label>Precio potencia P2 (€/kW/día, según factura)</label><input name="power_price_p2_eur_kw_day" type="number" step="0.000001" value="{{ cfg.power_price_p2_eur_kw_day }}"></div>
+<div><label>Alquiler contador (€/día)</label><input name="meter_rent_eur_day" type="number" step="0.0001" value="{{ cfg.meter_rent_eur_day }}"></div>
+<div><label>Otros costes fijos (€/mes)</label><input name="other_fixed_monthly_eur" type="number" step="0.01" value="{{ cfg.other_fixed_monthly_eur }}"></div>
+<div><label>Impuesto electricidad (%)</label><input name="electricity_tax_pct" type="number" step="0.000001" value="{{ cfg.electricity_tax_pct }}"></div>
+<div><label>IVA (%)</label><input name="vat_pct" type="number" step="0.01" value="{{ cfg.vat_pct }}"></div>
+<div><label>Descuento sobre energía (%)</label><input name="extra_discount_pct" type="number" step="0.01" value="{{ cfg.extra_discount_pct }}"></div>
+</div>
+<p class="hint">El término de potencia, el alquiler del contador y los otros fijos solo se suman en las zonas marcadas como «Paga fijos» en Equipos. El resto de zonas muestran su energía con impuestos.</p>
+</section>
+
+<section class="card" id="equipos"><h2>Equipos</h2>
+<p class="hint">Los cambios se aplican al guardar, sin reiniciar. El identificador da nombre a la base de datos de la zona (<code>&lt;id&gt;.db</code>; la principal usa <code>shelly.db</code>) y no se puede cambiar una vez creado. Para un Shelly, la IP puede incluir el puerto (<code>192.168.1.10:8080</code>). «Dentro de» indica que ese medidor está en un circuito de otra zona, para el reparto del histórico. Si cambias el modelo o la IP de una zona, el consumo se empieza a contar desde la primera lectura del equipo nuevo.</p>
+<input type="hidden" name="zone_count" value="{{ zones|length + 1 }}">
+{% macro zone_fields(i, key, z, is_new) %}
+<fieldset class="zone"><legend>{% if is_new %}Añadir un medidor{% else %}{{ z.name or key }}{% endif %}</legend>
+{% if not is_new and zone_errors.get(key) %}<p class="small warn" style="margin-top:0">{{ zone_errors[key] }}</p>{% endif %}
+<div class="zgrid">
+<div><label>Identificador</label><input name="z{{ i }}_key" value="{{ key }}" {% if is_new %}placeholder="p. ej. garaje" pattern="[a-z0-9_]{1,30}"{% else %}readonly title="El identificador no se puede cambiar"{% endif %}></div>
+<div class="span2"><label>Nombre</label><input name="z{{ i }}_name" value="{{ z.name }}" placeholder="Nombre visible"></div>
+<div class="span2"><label>Modelo</label><select name="z{{ i }}_model">{% for m, label in models.items() %}<option value="{{ m }}" {{ 'selected' if z.model == m }}>{{ label }}</option>{% endfor %}</select></div>
+<div><label>IP</label><input name="z{{ i }}_ip" value="{{ z.ip }}" placeholder="192.168.x.x"></div>
+<div><label>Puerto Modbus</label><input name="z{{ i }}_port" type="number" value="{{ z.port }}"></div>
+<div><label>Slave ID Modbus</label><input name="z{{ i }}_slave_id" type="number" value="{{ z.slave_id }}"></div>
+<div><label>Tensión (PM710)</label><select name="z{{ i }}_voltage"><option value="ll" {{ 'selected' if z.voltage != 'ln' }}>Fase-fase (1014)</option><option value="ln" {{ 'selected' if z.voltage == 'ln' }}>Fase-neutro (1016)</option></select></div>
+<div><label>Dentro de</label><select name="z{{ i }}_parent"><option value="">— (ninguna)</option>{% for k2, z2 in zones.items() if k2 != key %}<option value="{{ k2 }}" {{ 'selected' if z.parent == k2 }}>{{ z2.name or k2 }}</option>{% endfor %}</select></div>
+<div><label>Avisar si supera (W, 0 = no)</label><input name="z{{ i }}_power_alert_w" type="number" step="1" min="0" value="{{ z.power_alert_w|int }}"></div>
+<div><label>Durante (min)</label><input name="z{{ i }}_power_alert_minutes" type="number" step="1" min="1" value="{{ z.power_alert_minutes|int }}"></div>
+</div>
+<div class="row" style="margin-top:12px;gap:18px">
+<label class="check"><input type="checkbox" name="z{{ i }}_enabled" value="1" {{ 'checked' if z.enabled }}> Activa</label>
+<label class="check"><input type="checkbox" name="z{{ i }}_fixed_costs" value="1" {{ 'checked' if z.fixed_costs }}> Paga término fijo y alquiler</label>
+{% if not is_new and key != default_zone %}<label class="check"><input type="checkbox" name="z{{ i }}_delete" value="1"> Borrar (deja de leerla; el .db se conserva)</label>{% endif %}
+</div></fieldset>
+{% endmacro %}
+{% for key, z in zones.items() %}{{ zone_fields(loop.index0, key, z, False) }}{% endfor %}
+{{ zone_fields(zones|length, '', {'name': '', 'model': 'pro_em', 'ip': '', 'port': 502, 'slave_id': 1, 'voltage': 'll', 'parent': '', 'power_alert_w': 0, 'power_alert_minutes': 2, 'enabled': True, 'fixed_costs': False}, True) }}
+<p class="hint">Para añadir un medidor, rellena al menos el identificador y la IP en «Añadir un medidor».</p>
+</section>
+
+<section class="card" id="avisos"><h2>Avisos</h2>
+<p class="hint">Los avisos aparecen siempre en el monitor. Si configuras un bot de Telegram, también te llegan al móvil: crea el bot con @BotFather, escríbele un mensaje y pon aquí su token y tu chat ID (lo puedes ver con @userinfobot).</p>
+<div class="cols">
+<div><label>Token del bot de Telegram</label><input name="telegram_token" type="password" autocomplete="off" placeholder="{{ 'Guardado. Déjalo vacío para mantenerlo' if cfg.telegram_token else '123456:ABC…' }}">
+{% if cfg.telegram_token %}<label class="check"><input type="checkbox" name="telegram_token_delete" value="1"> Borrar el token guardado</label>{% endif %}</div>
+<div><label>Chat ID de Telegram</label><input name="telegram_chat_id" value="{{ cfg.telegram_chat_id }}"></div>
+<div><label>Avisar si un medidor no responde durante (min, 0 = nunca)</label><input name="offline_alert_minutes" type="number" min="0" step="1" value="{{ cfg.offline_alert_minutes|int }}"></div>
+<div></div>
+<div><label class="check"><input type="checkbox" name="cheap_hours_enabled" value="1" {{ 'checked' if cfg.cheap_hours_enabled }}> Avisar cada día de las horas más baratas de mañana</label></div><div></div>
+<div><label>Número de horas baratas</label><input name="cheap_hours_count" type="number" min="1" max="12" value="{{ cfg.cheap_hours_count }}"></div>
+<div><label>Hora del aviso (los precios de mañana salen hacia las 20:15)</label><input name="cheap_hours_time" type="time" value="{{ cfg.cheap_hours_time }}"></div>
+</div>
+<p class="hint">El aviso de consumo alto se configura por zona en Equipos («Aviso &gt; W»): salta cuando la potencia está por encima de ese valor durante todos los minutos indicados.</p>
+<p><button type="submit" formaction="{{ url_for('probar_telegram') }}" class="alt">Enviar mensaje de prueba (usa los datos ya guardados)</button></p>
+</section>
+
+<section class="card" id="historico"><h2>Histórico</h2>
+<p class="hint">El consumo, el coste y la potencia media y máxima se guardan siempre por horas. Además se guardan las lecturas de 5 s (tensión, corriente, etc.), que ocupan mucho más: unos 6 millones de filas al año por zona.</p>
+<label>Conservar las lecturas de 5 s durante (días, 0 = siempre)</label><input name="raw_retention_days" type="number" min="0" step="1" value="{{ cfg.raw_retention_days }}" style="max-width:240px">
+<p class="hint warn">Si pones un número, las lecturas de 5 s más antiguas se borran de forma definitiva cada hora. El resumen por horas no se borra. Haz una copia de los .db antes si quieres conservarlas.</p>
+</section>
+
+<section class="card" id="seguridad"><h2>Seguridad</h2>
+{% if has_password %}<p class="hint good">Los ajustes están protegidos con contraseña.</p>{% else %}<p class="hint bad">Sin contraseña: cualquiera en tu red puede abrir esta página y cambiar los ajustes.</p>{% endif %}
+<div class="cols">
+<div><label>{{ 'Nueva contraseña' if has_password else 'Contraseña' }}</label><input name="new_password" type="password" autocomplete="new-password" minlength="6"></div>
+<div><label>Repite la contraseña</label><input name="new_password_repeat" type="password" autocomplete="new-password"></div>
+</div>
+{% if has_password %}<label class="check"><input type="checkbox" name="remove_password" value="1"> Quitar la contraseña</label>{% endif %}
+<p class="hint">Si la olvidas, borra la línea <code>admin_password_hash</code> de config.json y reinicia la aplicación.</p>
+</section>
+
+<div class="save"><button type="submit">Guardar ajustes y actualizar precios</button><a href="/">Cancelar</a></div>
+</form></main></body></html>

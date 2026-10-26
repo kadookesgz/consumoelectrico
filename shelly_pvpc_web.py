@@ -1,31 +1,46 @@
-from flask import Flask, jsonify, render_template_string, request, redirect, url_for, flash, Response
-import requests, sqlite3, threading, time, json, csv, io, os, asyncio, re, struct
+from flask import Flask, jsonify, render_template, request, redirect, url_for, flash, Response, session
+import requests, sqlite3, threading, time, json, csv, io, sys, asyncio, re, struct, secrets, logging, bisect
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from functools import wraps
+from logging.handlers import RotatingFileHandler
 from zoneinfo import ZoneInfo
+from pathlib import Path
 import aiohttp
 from esios_api import PVPCData
-from pathlib import Path
 from pymodbus.client import ModbusTcpClient
+from werkzeug.security import generate_password_hash, check_password_hash
 
-ZONES = {
-    "principal": {"name": "Principal · Shelly Pro EM-50", "ip": "192.168.4.175", "model": "pro_em"},
-    "acuario": {"name": "Acuario · Shelly PM Mini Gen 3", "ip": "192.168.4.203", "model": "pm_mini_gen3"},
-    "schneider": {"name": "Schneider PowerLogic PM710", "ip": "192.168.100.206", "port": 502, "slave_id": 1, "model": "pm710_modbus"},
-}
-DEFAULT_ZONE = "principal"
-IP = ZONES[DEFAULT_ZONE]["ip"]
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = BASE_DIR / "shelly.db"
+CONFIG_PATH = BASE_DIR / "config.json"
+LOG_PATH = BASE_DIR / "app.log"
 PORT = 5000
 POLL_SECONDS = 5
-DB_PATH = Path(__file__).with_name("shelly.db")
-CONFIG_PATH = Path(__file__).with_name("config.json")
-ESIOS_URL = "https://api.esios.ree.es/indicators/1001"
-PENINSULA_GEO_ID = 8741
-app = Flask(__name__)
-app.secret_key = "local-shelly-pvpc-change-me"
-lock = threading.Lock()
-latest_error = ""
-ZONE_ERRORS = {zone: "Esperando primera lectura" for zone in ZONES}
+GAP_SECONDS = 300
+DEFAULT_ZONE = "principal"
+PVPC_TZ = ZoneInfo("Europe/Madrid")
+ZONE_KEY_RE = re.compile(r"^[a-z0-9_]{1,30}$")
+MODELS = {
+    "pro_em": "Shelly Pro EM (EM1)",
+    "pm_mini_gen3": "Shelly PM Mini Gen3 (PM1)",
+    "pm710_modbus": "Schneider PM710 (Modbus TCP)",
+}
 
+DEFAULT_ZONES = {
+    "principal": {"name": "Principal · Shelly Pro EM-50", "model": "pro_em", "ip": "192.168.4.175", "fixed_costs": True},
+    "acuario": {"name": "Acuario · Shelly PM Mini Gen 3", "model": "pm_mini_gen3", "ip": "192.168.4.203"},
+    "schneider": {"name": "Schneider PowerLogic PM710", "model": "pm710_modbus", "ip": "192.168.100.206", "port": 502, "slave_id": 1},
+}
+ZONE_DEFAULTS = {
+    "name": "", "model": "pro_em", "ip": "", "port": 502, "slave_id": 1,
+    "voltage": "ll",          # PM710: "ll" = media fase-fase (1014), "ln" = media fase-neutro (1016)
+    "fixed_costs": False,     # la factura de esta zona incluye término de potencia, alquiler y fijos
+    "parent": "",             # zona en la que está incluido este medidor (para el reparto)
+    "enabled": True,
+    "power_alert_w": 0.0,     # 0 = sin aviso de consumo alto
+    "power_alert_minutes": 2,
+}
 DEFAULTS = {
     "esios_token": "",
     "power_kw_p1": 4.6,
@@ -36,170 +51,289 @@ DEFAULTS = {
     "electricity_tax_pct": 5.11269632,
     "vat_pct": 21.0,
     "other_fixed_monthly_eur": 0.0,
-    "extra_discount_pct": 0.0
+    "extra_discount_pct": 0.0,
+    "raw_retention_days": 0,  # 0 = conservar todas las lecturas de 5 s
+    "admin_password_hash": "",
+    "secret_key": "",
+    "telegram_token": "",
+    "telegram_chat_id": "",
+    "offline_alert_minutes": 10,
+    "cheap_hours_enabled": False,
+    "cheap_hours_count": 3,
+    "cheap_hours_time": "20:45",
 }
+
+app = Flask(__name__)
+log = logging.getLogger("consumo")
+config_lock = threading.Lock()
+ZONES = {}
+ZONE_ERRORS = {}
+ZONE_STATE = {}   # zone -> texto mientras se prepara el resumen horario
+LAST_OK = {}      # zone -> epoch de la última lectura correcta
+POLLERS = {}      # zone -> Thread
+STARTED_AT = time.time()
+
+# ---------------------------------------------------------------- configuración
+
+def normalize_zones(zones):
+    out = {}
+    for key, z in (zones or {}).items():
+        out[key] = {**ZONE_DEFAULTS, **z}
+    if DEFAULT_ZONE not in out:
+        out = {DEFAULT_ZONE: {**ZONE_DEFAULTS, **DEFAULT_ZONES[DEFAULT_ZONE]}, **out}
+    return out
 
 def load_config():
     cfg = dict(DEFAULTS)
     if CONFIG_PATH.exists():
         try:
             cfg.update(json.loads(CONFIG_PATH.read_text(encoding="utf-8")))
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning("No se pudo leer config.json: %s", e)
+    cfg["zones"] = normalize_zones(cfg.get("zones") or DEFAULT_ZONES)
     return cfg
 
 def save_config(cfg):
-    CONFIG_PATH.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+    with config_lock:
+        tmp = CONFIG_PATH.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(CONFIG_PATH)
+
+def reload_zones():
+    zones = load_config()["zones"]
+    ZONES.clear()
+    ZONES.update(zones)
+
+def zone_connection(dev):
+    if dev["model"] == "pm710_modbus":
+        return f"{dev['ip']}:{dev['port']} · Modbus TCP · Slave ID {dev['slave_id']}"
+    return dev["ip"]
+
+# ---------------------------------------------------------------- base de datos
+
+ZONE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS measurements (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL, epoch REAL NOT NULL,
+  voltage REAL, current REAL, act_power REAL, aprt_power REAL, pf REAL, freq REAL,
+  total_kwh REAL NOT NULL, returned_kwh REAL NOT NULL, delta_kwh REAL NOT NULL DEFAULT 0,
+  energy_cost_eur REAL NOT NULL DEFAULT 0, pvpc_eur_mwh REAL);
+CREATE INDEX IF NOT EXISTS idx_measurements_epoch ON measurements(epoch);
+CREATE TABLE IF NOT EXISTS hourly (
+  epoch INTEGER PRIMARY KEY, label TEXT NOT NULL,
+  kwh REAL NOT NULL DEFAULT 0, cost_eur REAL NOT NULL DEFAULT 0, priced_kwh REAL NOT NULL DEFAULT 0,
+  power_sum REAL NOT NULL DEFAULT 0, power_n INTEGER NOT NULL DEFAULT 0, power_max REAL, power_max_at TEXT);
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+"""
+SHARED_SCHEMA = """
+CREATE TABLE IF NOT EXISTS pvpc_prices (epoch INTEGER PRIMARY KEY, price_eur_mwh REAL NOT NULL, fetched_at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS alerts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, epoch REAL NOT NULL, zone TEXT, kind TEXT NOT NULL,
+  message TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 0, resolved_epoch REAL);
+"""
 
 def db_path_for_zone(zone=None):
     if zone in (None, "", DEFAULT_ZONE):
         return DB_PATH
-    if zone not in ZONES:
+    if not ZONE_KEY_RE.match(zone):
         raise ValueError("Zona desconocida")
-    return Path(__file__).with_name(f"{zone}.db")
+    return BASE_DIR / f"{zone}.db"
 
-def connect(zone=None):
-    return sqlite3.connect(db_path_for_zone(zone), timeout=10)
+@contextmanager
+def db(zone=None, rows=False):
+    c = sqlite3.connect(db_path_for_zone(zone), timeout=30)
+    if rows:
+        c.row_factory = sqlite3.Row
+    try:
+        with c:
+            yield c
+    finally:
+        c.close()
 
-def init_db():
-    with connect() as c:
-        c.execute("""CREATE TABLE IF NOT EXISTS measurements (
-          id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL, epoch REAL NOT NULL,
-          voltage REAL, current REAL, act_power REAL, aprt_power REAL, pf REAL, freq REAL,
-          total_kwh REAL NOT NULL, returned_kwh REAL NOT NULL, delta_kwh REAL NOT NULL DEFAULT 0,
-          energy_cost_eur REAL NOT NULL DEFAULT 0, pvpc_eur_mwh REAL)""")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_measurements_epoch ON measurements(epoch)")
+def init_db(zone):
+    with db(zone) as c:
+        c.execute("PRAGMA journal_mode=WAL")
+        c.executescript(ZONE_SCHEMA)
         cols = {r[1] for r in c.execute("PRAGMA table_info(measurements)")}
         for name, typ in [("energy_cost_eur", "REAL NOT NULL DEFAULT 0"), ("pvpc_eur_mwh", "REAL")]:
             if name not in cols:
                 c.execute(f"ALTER TABLE measurements ADD COLUMN {name} {typ}")
-        c.execute("""CREATE TABLE IF NOT EXISTS pvpc_prices (
-          epoch INTEGER PRIMARY KEY, price_eur_mwh REAL NOT NULL, fetched_at REAL NOT NULL)""")
+        if zone == DEFAULT_ZONE:
+            c.executescript(SHARED_SCHEMA)
 
-def init_db_for_zone(zone):
-    """Create the standard tables in a zone-specific database."""
-    with connect(zone) as c:
-        c.execute("""CREATE TABLE IF NOT EXISTS measurements (
-          id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL, epoch REAL NOT NULL,
-          voltage REAL, current REAL, act_power REAL, aprt_power REAL, pf REAL, freq REAL,
-          total_kwh REAL NOT NULL, returned_kwh REAL NOT NULL, delta_kwh REAL NOT NULL DEFAULT 0,
-          energy_cost_eur REAL NOT NULL DEFAULT 0, pvpc_eur_mwh REAL)""")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_measurements_epoch ON measurements(epoch)")
-        c.execute("""CREATE TABLE IF NOT EXISTS pvpc_prices (
-          epoch INTEGER PRIMARY KEY, price_eur_mwh REAL NOT NULL, fetched_at REAL NOT NULL)""")
+def get_meta(key, zone=DEFAULT_ZONE):
+    with db(zone) as c:
+        row = c.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    return row[0] if row else None
 
+def set_meta(key, value, zone=DEFAULT_ZONE):
+    with db(zone) as c:
+        c.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", (key, str(value)))
 
-def rpc(method, params=None, ip=IP):
+def local_stamp(epoch):
+    return datetime.fromtimestamp(epoch).strftime("%Y-%m-%d %H:%M:%S")
+
+def hour_label(hour_epoch):
+    return datetime.fromtimestamp(hour_epoch).strftime("%Y-%m-%d %H")
+
+def day_start(dt):
+    return dt.replace(hour=0, minute=0, second=0, microsecond=0)
+
+# ---------------------------------------------------------------- precios PVPC
+
+class PriceIndex:
+    """In-memory view of pvpc_prices for fast lookups. A price is valid for at most one hour."""
+    def __init__(self, rows):
+        rows = sorted(rows)
+        self.epochs = [r[0] for r in rows]
+        self.prices = [r[1] for r in rows]
+
+    @classmethod
+    def load(cls, start=None, end=None):
+        with db() as c:
+            if start is None:
+                rows = c.execute("SELECT epoch,price_eur_mwh FROM pvpc_prices").fetchall()
+            else:
+                rows = c.execute("SELECT epoch,price_eur_mwh FROM pvpc_prices WHERE epoch>=? AND epoch<?",
+                                 (int(start) - 3600, int(end) + 3600)).fetchall()
+        return cls(rows)
+
+    def at(self, epoch):
+        i = bisect.bisect_right(self.epochs, epoch) - 1
+        if i >= 0 and epoch - self.epochs[i] < 3600:
+            return self.prices[i]
+        return None
+
+    def hour_average(self, hour_epoch):
+        lo = bisect.bisect_left(self.epochs, hour_epoch)
+        hi = bisect.bisect_left(self.epochs, hour_epoch + 3600)
+        values = self.prices[lo:hi]
+        if values:
+            return sum(values) / len(values)
+        return self.at(hour_epoch)
+
+def price_for_epoch(epoch):
+    with db() as c:
+        row = c.execute("SELECT epoch,price_eur_mwh FROM pvpc_prices WHERE epoch<=? ORDER BY epoch DESC LIMIT 1",
+                        (int(epoch),)).fetchone()
+    return float(row[1]) if row and epoch - row[0] < 3600 else None
+
+def fetch_pvpc(now_utc=None):
+    """
+    Descarga el PVPC 2.0TD con `esios_api` (la biblioteca de Home Assistant) y guarda
+    todos los precios que devuelve, con su marca de tiempo UTC: el día de `now_utc` y,
+    a partir de las 20:00, también el día siguiente. Los precios llegan en €/kWh y se
+    guardan en €/MWh. Pasando una fecha pasada descarga ese día (relleno de huecos).
+    """
+    now_utc = now_utc or datetime.now(timezone.utc)
+    token = str(load_config().get("esios_token", "")).strip()
+
+    async def _get_prices():
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=35)) as s:
+            api = PVPCData(session=s, tariff="2.0TD", local_timezone=PVPC_TZ,
+                           api_token=token or None, sensor_keys=("PVPC",))
+            data = await api.async_update_all(current_data=None, now=now_utc)
+            return dict(data.sensors.get("PVPC") or {})
+
+    try:
+        prices = asyncio.run(_get_prices())
+    except Exception as exc:
+        raise RuntimeError(f"esios_api (biblioteca de Home Assistant): {exc}") from exc
+    rows = [(int(ts.timestamp()), float(p) * 1000.0, time.time()) for ts, p in prices.items() if p is not None]
+    if not rows:
+        raise RuntimeError("ESIOS no ha devuelto precios para "
+                           f"{now_utc.astimezone(PVPC_TZ):%d/%m/%Y}; revisa la conexión y, si hace falta, el token.")
+    with db() as c:
+        c.executemany("INSERT OR REPLACE INTO pvpc_prices(epoch,price_eur_mwh,fetched_at) VALUES(?,?,?)", rows)
+    return len(rows)
+
+FAILED_PRICE_DAYS = {}
+
+def backfill_prices(max_days=10):
+    """Descarga precios de días pasados con consumo registrado pero sin precio."""
+    days = set()
+    for zone in list(ZONES):
+        try:
+            with db(zone) as c:
+                days.update(r[0] for r in c.execute(
+                    "SELECT DISTINCT substr(label,1,10) FROM hourly WHERE priced_kwh < kwh - 1e-9"))
+        except sqlite3.Error:
+            continue
+    today = datetime.now().date().isoformat()
+    pending = [d for d in sorted(days, reverse=True)
+               if d <= today and FAILED_PRICE_DAYS.get(d) != today][:max_days]
+    for d in pending:
+        noon = datetime.strptime(d, "%Y-%m-%d").replace(hour=12, tzinfo=PVPC_TZ)
+        try:
+            fetch_pvpc(noon.astimezone(timezone.utc))
+            FAILED_PRICE_DAYS.pop(d, None)
+        except Exception as e:
+            FAILED_PRICE_DAYS[d] = today  # no reintentar hasta mañana
+            log.warning("Sin precios PVPC para %s: %s", d, e)
+        time.sleep(1)
+
+def reprice_zone(zone, prices=None):
+    """Asigna coste a la energía que se registró sin precio, cuando el precio ya está disponible."""
+    with db(zone) as c:
+        pending = c.execute("SELECT epoch,kwh,priced_kwh FROM hourly WHERE priced_kwh < kwh - 1e-9").fetchall()
+        if not pending:
+            return 0
+        prices = prices or PriceIndex.load()
+        fixed = 0
+        for hour, kwh, priced in pending:
+            price = prices.hour_average(hour)
+            if price is None:
+                continue
+            c.execute("UPDATE hourly SET cost_eur=cost_eur+?, priced_kwh=kwh WHERE epoch=?",
+                      ((kwh - priced) * price / 1000.0, hour))
+            c.execute("""UPDATE measurements SET pvpc_eur_mwh=?, energy_cost_eur=delta_kwh*?/1000.0
+                         WHERE epoch>=? AND epoch<? AND pvpc_eur_mwh IS NULL""", (price, price, hour, hour + 3600))
+            fixed += 1
+    return fixed
+
+def refresh_prices():
+    try:
+        n = fetch_pvpc()
+        log.info("PVPC actualizado: %d precios", n)
+    except Exception as e:
+        log.warning("Aviso PVPC: %s", e)
+    backfill_prices()
+    prices = PriceIndex.load()
+    for zone in list(ZONES):
+        try:
+            reprice_zone(zone, prices)
+        except sqlite3.Error as e:
+            log.warning("No se pudo recalcular el coste de %s: %s", zone, e)
+
+def hourly_ready(zone):
+    try:
+        return bool(get_meta("hourly_built", zone))
+    except sqlite3.Error:
+        return False
+
+def price_refresh_loop():
+    # The first run waits (up to 10 min) for the hourly summaries, so it can fill in missing past prices.
+    deadline = time.time() + 600
+    while time.time() < deadline and not all(hourly_ready(z) for z, d in list(ZONES.items()) if d["enabled"]):
+        time.sleep(2)
+    while True:
+        refresh_prices()
+        # Los precios de mañana se publican hacia las 20:15: en esa franja se mira más a menudo.
+        hour = datetime.now(PVPC_TZ).hour
+        time.sleep(900 if 20 <= hour <= 22 else 3600)
+
+# ---------------------------------------------------------------- lectura de medidores
+
+def rpc(method, params, ip):
     r = requests.get(f"http://{ip}/rpc/{method}", params=params or {}, timeout=4)
     r.raise_for_status()
     return r.json()
-
-def fetch_pvpc(start, end):
-    """
-    Usa la biblioteca `esios_api` declarada por Home Assistant para PVPC.
-    La aplicación almacena el precio en €/MWh, por lo que convierte el valor
-    de la biblioteca (€/kWh) multiplicándolo por 1000.
-    """
-    token = str(load_config().get("esios_token", "")).strip()
-
-    async def _get_data():
-        timeout = aiohttp.ClientTimeout(total=35)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            api = PVPCData(
-                session=session,
-                tariff="2.0TD",
-                local_timezone=ZoneInfo("Europe/Madrid"),
-                api_token=token or None,
-                sensor_keys=("PVPC",),
-            )
-            now_utc = datetime.now(timezone.utc)
-            data = await api.async_update_all(current_data=None, now=now_utc)
-            return api, data
-
-    try:
-        api, data = asyncio.run(_get_data())
-        attrs = getattr(api, "sensor_attributes", {}).get("PVPC", {}) or {}
-        local_now = datetime.now().astimezone()
-        start_epoch, end_epoch = start.timestamp(), end.timestamp()
-        prices_by_epoch = {}
-
-        for key, value in attrs.items():
-            # Current-day hourly attributes documented by esios_api.
-            match = re.fullmatch(r"price_(\d{2})h", str(key))
-            if not match:
-                continue
-            try:
-                hour = int(match.group(1))
-                price_eur_kwh = float(value)
-                hour_dt = local_now.replace(
-                    hour=hour, minute=0, second=0, microsecond=0
-                )
-                epoch = int(hour_dt.timestamp())
-                if start_epoch <= epoch <= end_epoch:
-                    prices_by_epoch[epoch] = price_eur_kwh * 1000.0
-            except (TypeError, ValueError):
-                continue
-
-        # Include the active hourly price if the library populated a state but
-        # did not expose all hour attributes.
-        current_price = getattr(api, "states", {}).get("PVPC")
-        if current_price is not None:
-            try:
-                price_eur_kwh = float(current_price)
-                hour_dt = local_now.replace(minute=0, second=0, microsecond=0)
-                epoch = int(hour_dt.timestamp())
-                if start_epoch <= epoch <= end_epoch:
-                    prices_by_epoch[epoch] = price_eur_kwh * 1000.0
-            except (TypeError, ValueError):
-                pass
-
-        if not prices_by_epoch:
-            # Expose helpful data shape in the error without leaking token.
-            keys = sorted(map(str, attrs.keys()))[:25]
-            raise RuntimeError(
-                "esios_api no ha devuelto precios horarios utilizables. "
-                f"Atributos recibidos: {keys or 'ninguno'}; "
-                "revisa conectividad y, si ESIOS lo exige, configura el token."
-            )
-
-        with connect() as c:
-            c.executemany(
-                "INSERT OR REPLACE INTO pvpc_prices(epoch,price_eur_mwh,fetched_at) VALUES(?,?,?)",
-                [(epoch, price, time.time()) for epoch, price in prices_by_epoch.items()]
-            )
-        return len(prices_by_epoch)
-    except Exception as exc:
-        raise RuntimeError(
-            "esios_api (biblioteca de Home Assistant): " + str(exc)
-        ) from exc
-
-def ensure_prices():
-    now = datetime.now().astimezone()
-    # Fetch from yesterday through tomorrow to cover recent history and today's schedule.
-    try:
-        with connect() as c:
-            newest = c.execute("SELECT MAX(epoch) FROM pvpc_prices").fetchone()[0]
-            oldest = c.execute("SELECT MIN(epoch) FROM pvpc_prices").fetchone()[0]
-        if newest is None or newest < now.timestamp() + 18*3600:
-            fetch_pvpc(now - timedelta(days=2), now + timedelta(days=2))
-        elif oldest is None or oldest > now.timestamp() - 24*3600:
-            fetch_pvpc(now - timedelta(days=2), now + timedelta(days=1))
-    except Exception as e:
-        print("Aviso PVPC:", e)
-
-def price_for_epoch(epoch):
-    with connect() as c:
-        row = c.execute("SELECT price_eur_mwh FROM pvpc_prices WHERE epoch<=? ORDER BY epoch DESC LIMIT 1", (int(epoch),)).fetchone()
-    return float(row[0]) if row else None
 
 def _float32(registers, offset):
     """Decode PM710 IEEE-754 float from two consecutive Modbus registers."""
     return float(struct.unpack(">f", struct.pack(">HH", registers[offset], registers[offset + 1]))[0])
 
-
-def read_zone(zone):
+def read_zone(dev):
     """Lee un Shelly o un Schneider PM710 y normaliza sus medidas."""
-    dev = ZONES[zone]
     ip = dev["ip"]
     if dev["model"] == "pm710_modbus":
         # PM710 direct floating-point map. PDU addresses are one less than
@@ -210,16 +344,17 @@ def read_zone(zone):
                 raise ConnectionError(f"No se pudo conectar por Modbus TCP a {ip}:{dev.get('port', 502)}")
             response = client.read_holding_registers(address=999, count=22, slave=int(dev.get("slave_id", 1)))
             if response.isError():
-                raise RuntimeError(f"Modbus FC03 devolvió error al leer registros PM710 1000–1020: {response}")
+                raise RuntimeError(f"Modbus FC03 devolvió error al leer registros PM710 1000–1021: {response}")
             regs = response.registers
             if len(regs) < 22:
                 raise RuntimeError(f"Respuesta Modbus incompleta: {len(regs)} registros; se esperaban 22")
             energy_kwh = _float32(regs, 0)      # 1000/1001: total real energy, kWh
             power_kw = _float32(regs, 6)        # 1006/1007: total real power, kW
             pf = _float32(regs, 12)             # 1012/1013: total power factor
-            voltage = _float32(regs, 14)       # 1014/1015: average line-line voltage
-            current = _float32(regs, 18)       # 1018/1019: average current
-            freq = _float32(regs, 20)          # 1020/1021: frequency, Hz
+            # 1014/1015: average line-line voltage; 1016/1017: average line-neutral voltage
+            voltage = _float32(regs, 16 if dev.get("voltage") == "ln" else 14)
+            current = _float32(regs, 18)        # 1018/1019: average current
+            freq = _float32(regs, 20)           # 1020/1021: frequency, Hz
             values = (energy_kwh, power_kw, voltage, current, freq)
             if not all(map(lambda v: abs(v) < 1e9, values)) or energy_kwh < 0 or voltage < 0 or current < 0 or freq < 0:
                 raise RuntimeError(f"Valores PM710 decodificados no válidos: energía={energy_kwh}, potencia={power_kw}, tensión={voltage}, corriente={current}, frecuencia={freq}. Revisar orden de palabras Modbus.")
@@ -229,14 +364,14 @@ def read_zone(zone):
         finally:
             client.close()
     if dev["model"] == "pro_em":
-        status = rpc("EM1.GetStatus", {"id": 0}, ip=ip)
-        energy = rpc("EM1Data.GetStatus", {"id": 0}, ip=ip)
+        status = rpc("EM1.GetStatus", {"id": 0}, ip)
+        energy = rpc("EM1Data.GetStatus", {"id": 0}, ip)
         total = float(energy["total_act_energy"]) / 1000.0  # Wh -> kWh
         returned = float(energy.get("total_act_ret_energy", 0)) / 1000.0
         return status, total, returned
 
     # Shelly PM Mini Gen3 is a power meter without a relay: its component is PM1.
-    status = rpc("PM1.GetStatus", {"id": 0}, ip=ip)
+    status = rpc("PM1.GetStatus", {"id": 0}, ip)
     total_wh = (status.get("aenergy") or {}).get("total")
     if total_wh is None:
         # Compatibility fallback for firmware variants with a different energy field.
@@ -253,212 +388,387 @@ def read_zone(zone):
     }
     return normalized, float(total_wh or 0) / 1000.0, float(returned_wh or 0) / 1000.0
 
+# ---------------------------------------------------------------- resumen horario
+
+def split_hours(t0, t1):
+    """Split [t0, t1) at hour boundaries: [(hour_epoch, start, end), ...]."""
+    if t1 <= t0:
+        return [(int(t1 // 3600 * 3600), t1, t1)]
+    out, t = [], t0
+    while t < t1:
+        hour = int(t // 3600 * 3600)
+        end = min(t1, hour + 3600)
+        out.append((hour, t, end))
+        t = end
+    return out
+
+def spread_energy(t0, t1, kwh, price_at):
+    """
+    Reparte el consumo medido entre dos lecturas de forma proporcional al tiempo.
+    Si la aplicación estuvo parada, el consumo del hueco se distribuye entre sus
+    horas en lugar de cargarse entero en la hora de la primera lectura posterior.
+    Devuelve [(hour_epoch, kwh, coste_eur, kwh_con_precio)].
+    """
+    parts = []
+    span = t1 - t0
+    for hour, a, b in split_hours(t0, t1):
+        part = kwh * (b - a) / span if span > 0 else kwh
+        price = price_at((a + b) / 2)
+        parts.append((hour, part, part * price / 1000.0 if price is not None else 0.0, part if price is not None else 0.0))
+    return parts
+
+UPSERT_ENERGY = """INSERT INTO hourly(epoch,label,kwh,cost_eur,priced_kwh) VALUES(?,?,?,?,?)
+    ON CONFLICT(epoch) DO UPDATE SET kwh=kwh+excluded.kwh, cost_eur=cost_eur+excluded.cost_eur,
+    priced_kwh=priced_kwh+excluded.priced_kwh"""
+UPSERT_POWER = """INSERT INTO hourly(epoch,label,power_sum,power_n,power_max,power_max_at) VALUES(?,?,?,1,?,?)
+    ON CONFLICT(epoch) DO UPDATE SET power_sum=power_sum+excluded.power_sum, power_n=power_n+1,
+    power_max_at=CASE WHEN power_max IS NULL OR excluded.power_max>power_max THEN excluded.power_max_at ELSE power_max_at END,
+    power_max=CASE WHEN power_max IS NULL OR excluded.power_max>power_max THEN excluded.power_max ELSE power_max END"""
+
+def record_reading(zone, status, total, returned, now=None, new_device=False):
+    """Guarda una lectura. Con new_device=True no se cuenta consumo desde la lectura anterior (otro contador)."""
+    now = now or time.time()
+    stamp = local_stamp(now)
+    price_now = price_for_epoch(now)
+    with db(zone) as c:
+        prev = c.execute("SELECT epoch,total_kwh FROM measurements ORDER BY id DESC LIMIT 1").fetchone()
+        # A lower counter means the meter was reset: nothing is counted for that interval.
+        delta = total - float(prev[1]) if prev and total >= float(prev[1]) and not new_device else 0.0
+        parts = spread_energy(prev[0], now, delta, price_for_epoch) if prev and delta > 0 else []
+        c.executemany(UPSERT_ENERGY, [(h, hour_label(h), k, e, p) for h, k, e, p in parts])
+        power = status.get("act_power")
+        if power is not None:
+            hour = int(now // 3600 * 3600)
+            c.execute(UPSERT_POWER, (hour, hour_label(hour), float(power), float(power), stamp))
+        c.execute("""INSERT INTO measurements(timestamp,epoch,voltage,current,act_power,aprt_power,pf,freq,total_kwh,returned_kwh,delta_kwh,energy_cost_eur,pvpc_eur_mwh)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (stamp, now, status.get("voltage"), status.get("current"), power, status.get("aprt_power"),
+             status.get("pf"), status.get("freq"), total, returned, delta, sum(p[2] for p in parts), price_now))
+
+def build_hourly(zone):
+    """Genera el resumen horario a partir de las lecturas ya guardadas (solo la primera vez)."""
+    if get_meta("hourly_built", zone):
+        return
+    ZONE_STATE[zone] = "Preparando el resumen horario del histórico…"
+    started = time.time()
+    prices = PriceIndex.load()
+    hours = {}
+    prev_epoch, n = None, 0
+    with db(zone) as c:
+        for epoch, delta, power, stamp in c.execute(
+                "SELECT epoch,delta_kwh,act_power,timestamp FROM measurements ORDER BY epoch"):
+            n += 1
+            if prev_epoch is not None and delta and delta > 0:
+                for h, k, e, p in spread_energy(prev_epoch, epoch, delta, prices.at):
+                    acc = hours.setdefault(h, [0.0, 0.0, 0.0, 0.0, 0, None, None])
+                    acc[0] += k; acc[1] += e; acc[2] += p
+            if power is not None:
+                h = int(epoch // 3600 * 3600)
+                acc = hours.setdefault(h, [0.0, 0.0, 0.0, 0.0, 0, None, None])
+                acc[3] += power; acc[4] += 1
+                if acc[5] is None or power > acc[5]:
+                    acc[5], acc[6] = power, stamp
+            prev_epoch = epoch
+        c.execute("DELETE FROM hourly")
+        c.executemany("""INSERT INTO hourly(epoch,label,kwh,cost_eur,priced_kwh,power_sum,power_n,power_max,power_max_at)
+                         VALUES(?,?,?,?,?,?,?,?,?)""", [(h, hour_label(h), *v) for h, v in hours.items()])
+        c.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('hourly_built',?)", (local_stamp(time.time()),))
+    log.info("Resumen horario de %s: %d lecturas en %d horas (%.1f s)", zone, n, len(hours), time.time() - started)
+    ZONE_STATE.pop(zone, None)
+
+def device_signature(dev):
+    return f"{dev['model']}|{dev['ip']}|{dev['port']}|{dev['slave_id']}" if dev["model"] == "pm710_modbus" else f"{dev['model']}|{dev['ip']}"
+
 def poller(zone):
-    """Polls a single zone into its own SQLite database."""
+    """Lee una zona cada POLL_SECONDS. Termina sola si la zona se borra o se desactiva."""
+    try:
+        init_db(zone)
+        build_hourly(zone)
+    except Exception as e:
+        ZONE_STATE.pop(zone, None)
+        ZONE_ERRORS[zone] = f"No se pudo preparar la base de datos: {e}"
+        log.exception("Error preparando %s", zone)
+        return
+    known_device = get_meta("device", zone)
     while True:
-        now = datetime.now().astimezone()
-        epoch = now.timestamp()
-        stamp = now.strftime("%Y-%m-%d %H:%M:%S")
+        dev = ZONES.get(zone)
+        if dev is None or not dev["enabled"]:
+            ZONE_ERRORS.pop(zone, None)
+            return
+        started = time.time()
+        device = device_signature(dev)
         try:
-            status, total, returned = read_zone(zone)
+            status, total, returned = read_zone(dev)
+            # If the zone now points to another meter, its counter is unrelated to the previous one.
+            record_reading(zone, status, total, returned, new_device=known_device not in (None, device))
+            if known_device != device:
+                set_meta("device", device, zone)
+                known_device = device
             ZONE_ERRORS[zone] = ""
-            price = price_for_epoch(epoch)
-            with connect(zone) as c:
-                prev = c.execute(
-                    "SELECT epoch,total_kwh,energy_cost_eur FROM measurements ORDER BY id DESC LIMIT 1"
-                ).fetchone()
-                delta = max(0.0, total - float(prev[1])) if prev else 0.0
-                if prev and total < float(prev[1]):
-                    delta = 0.0
-                cost_delta = delta * (price / 1000.0) if price is not None else 0.0
-                c.execute("""INSERT INTO measurements(timestamp,epoch,voltage,current,act_power,aprt_power,pf,freq,total_kwh,returned_kwh,delta_kwh,energy_cost_eur,pvpc_eur_mwh)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (stamp, epoch, status.get("voltage"), status.get("current"), status.get("act_power"),
-                     status.get("aprt_power"), status.get("pf"), status.get("freq"), total, returned,
-                     delta, cost_delta, price))
+            LAST_OK[zone] = time.time()
         except Exception as e:
             ZONE_ERRORS[zone] = f"{type(e).__name__}: {e}"
-            print(f"{stamp} | Error zona {zone} ({ZONES[zone]['ip']}): {e}")
-        time.sleep(POLL_SECONDS)
+            log.warning("Error zona %s (%s): %s", zone, dev["ip"], e)
+        time.sleep(max(0.5, POLL_SECONDS - (time.time() - started)))
 
-def price_refresh_loop():
+def start_pollers():
+    for zone, dev in list(ZONES.items()):
+        thread = POLLERS.get(zone)
+        if dev["enabled"] and not (thread and thread.is_alive()):
+            ZONE_ERRORS.setdefault(zone, "Esperando primera lectura")
+            POLLERS[zone] = threading.Thread(target=poller, args=(zone,), daemon=True, name=f"poller-{zone}")
+            POLLERS[zone].start()
+
+def maintenance_loop():
+    """Borra las lecturas de 5 s más antiguas que el periodo configurado (el resumen horario se conserva)."""
     while True:
-        ensure_prices()
         time.sleep(3600)
+        days = int(load_config().get("raw_retention_days") or 0)
+        if days <= 0:
+            continue
+        limit = time.time() - days * 86400
+        for zone in list(ZONES):
+            try:
+                if not get_meta("hourly_built", zone):
+                    continue
+                with db(zone) as c:
+                    n = c.execute("""DELETE FROM measurements WHERE epoch<?
+                                     AND id < (SELECT MAX(id) FROM measurements)""", (limit,)).rowcount
+                if n:
+                    log.info("Borradas %d lecturas de %s anteriores a %s", n, zone, local_stamp(limit))
+            except sqlite3.Error as e:
+                log.warning("Limpieza de %s: %s", zone, e)
 
-def bill_summary():
+# ---------------------------------------------------------------- avisos
+
+def notify(text):
     cfg = load_config()
+    token, chat = cfg.get("telegram_token", "").strip(), str(cfg.get("telegram_chat_id", "")).strip()
+    if not token or not chat:
+        return False
+    r = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                      json={"chat_id": chat, "text": text}, timeout=10)
+    r.raise_for_status()
+    return True
+
+def safe_notify(text):
+    try:
+        notify(text)
+    except Exception as e:
+        log.warning("No se pudo enviar el aviso por Telegram: %s", e)
+
+def raise_alert(zone, kind, message, active=True):
+    with db() as c:
+        if active and c.execute("SELECT 1 FROM alerts WHERE zone IS ? AND kind=? AND active=1", (zone, kind)).fetchone():
+            return False
+        c.execute("INSERT INTO alerts(epoch,zone,kind,message,active) VALUES(?,?,?,?,?)",
+                  (time.time(), zone, kind, message, 1 if active else 0))
+    safe_notify(message)
+    return True
+
+def resolve_alert(zone, kind, message):
+    with db() as c:
+        n = c.execute("UPDATE alerts SET active=0, resolved_epoch=? WHERE zone IS ? AND kind=? AND active=1",
+                      (time.time(), zone, kind)).rowcount
+    if n:
+        safe_notify(message)
+
+def check_zone_alerts(cfg, now):
+    offline_min = float(cfg.get("offline_alert_minutes") or 0)
+    for zone, dev in list(ZONES.items()):
+        if not dev["enabled"] or zone in ZONE_STATE:
+            continue
+        name = dev["name"] or zone
+        last = LAST_OK.get(zone, STARTED_AT)
+        if offline_min > 0 and now - last > offline_min * 60:
+            raise_alert(zone, "sin_conexion", f"⚠️ {name}: sin lecturas desde hace {int((now - last) // 60)} min. "
+                        f"Último error: {(ZONE_ERRORS.get(zone) or '—')[:160]}")
+        elif zone in LAST_OK and now - LAST_OK[zone] < 60:
+            resolve_alert(zone, "sin_conexion", f"✅ {name}: vuelve a responder.")
+        limit_w = float(dev.get("power_alert_w") or 0)
+        if limit_w > 0:
+            minutes = max(1.0, float(dev.get("power_alert_minutes") or 1))
+            with db(zone) as c:
+                low, n = c.execute("SELECT MIN(act_power), COUNT(*) FROM measurements WHERE epoch>=?",
+                                   (now - minutes * 60,)).fetchone()
+            # Only when the whole window is above the limit, so short peaks don't trigger it.
+            if n and n >= max(2, minutes * 60 / POLL_SECONDS * 0.5) and low is not None and low > limit_w:
+                raise_alert(zone, "consumo_alto", f"⚡ {name}: consumo por encima de {limit_w:.0f} W "
+                            f"durante {minutes:g} min (mínimo {low:.0f} W).")
+            elif n and low is not None and low <= limit_w:
+                resolve_alert(zone, "consumo_alto", f"✅ {name}: el consumo vuelve a estar por debajo de {limit_w:.0f} W.")
+
+def cheapest_hours(day, count):
+    """Las `count` horas más baratas del día local `day` (date), o None si aún no hay precios."""
+    start = datetime(day.year, day.month, day.day).astimezone().timestamp()
+    end = (datetime(day.year, day.month, day.day) + timedelta(days=1)).astimezone().timestamp()
+    with db() as c:
+        rows = c.execute("SELECT epoch,price_eur_mwh FROM pvpc_prices WHERE epoch>=? AND epoch<?", (start, end)).fetchall()
+    by_hour = {}
+    for epoch, price in rows:
+        by_hour.setdefault(int(epoch // 3600 * 3600), []).append(price)
+    if len(by_hour) < 23:
+        return None
+    hours = sorted((sum(v) / len(v), h) for h, v in by_hour.items())[:count]
+    return [(h, p) for p, h in sorted(hours, key=lambda x: x[1])]
+
+def check_cheap_hours(cfg, now):
+    if not cfg.get("cheap_hours_enabled"):
+        return
+    local = datetime.fromtimestamp(now)
+    try:
+        hh, mm = map(int, str(cfg.get("cheap_hours_time", "20:45")).split(":"))
+    except ValueError:
+        hh, mm = 20, 45
+    if (local.hour, local.minute) < (hh, mm):
+        return
+    tomorrow = (local + timedelta(days=1)).date()
+    if get_meta("cheap_hours_sent") == tomorrow.isoformat():
+        return
+    hours = cheapest_hours(tomorrow, max(1, int(cfg.get("cheap_hours_count") or 3)))
+    if not hours:
+        return
+    text = f"💡 Horas más baratas mañana {tomorrow:%d/%m}: " + ", ".join(
+        f"{datetime.fromtimestamp(h):%H}h ({p / 1000:.3f} €/kWh)".replace(".", ",") for h, p in hours)
+    raise_alert(None, "horas_baratas", text, active=False)
+    set_meta("cheap_hours_sent", tomorrow.isoformat())
+
+def alert_loop():
+    time.sleep(30)
+    while True:
+        now = time.time()
+        cfg = load_config()
+        for check in (check_zone_alerts, check_cheap_hours):
+            try:
+                check(cfg, now)
+            except Exception:
+                log.exception("Error comprobando avisos")
+        time.sleep(30)
+
+# ---------------------------------------------------------------- factura
+
+def bill_for(zone, energy_eur, cfg, localnow):
+    """Estimación de factura del mes en curso. El término fijo solo cuenta en las zonas que lo pagan."""
+    fixed = bool(ZONES.get(zone, {}).get("fixed_costs"))
+    days = localnow.day
+    month_days = (localnow.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
+    power_cost = meter_cost = other_fixed = 0.0
+    if fixed:
+        power_cost = (float(cfg["power_kw_p1"]) * float(cfg["power_price_p1_eur_kw_day"]) +
+                      float(cfg["power_kw_p2"]) * float(cfg["power_price_p2_eur_kw_day"])) * days
+        meter_cost = float(cfg["meter_rent_eur_day"]) * days
+        other_fixed = float(cfg["other_fixed_monthly_eur"]) * days / month_days.day
+    discount = energy_eur * float(cfg["extra_discount_pct"]) / 100.0
+    taxable = max(0.0, energy_eur - discount) + power_cost + other_fixed
+    # El impuesto eléctrico no grava el alquiler del contador; el IVA sí.
+    elec_tax = taxable * float(cfg["electricity_tax_pct"]) / 100.0
+    vat = (taxable + elec_tax + meter_cost) * float(cfg["vat_pct"]) / 100.0
+    return {"fixed_costs": fixed, "power_cost": power_cost, "meter_cost": meter_cost, "other_fixed": other_fixed,
+            "discount": discount, "taxable_base": taxable, "electricity_tax": elec_tax, "vat": vat,
+            "month_total_estimate": taxable + elec_tax + meter_cost + vat}
+
+# ---------------------------------------------------------------- web: seguridad
+
+def admin_required(view):
+    @wraps(view)
+    def wrapper(*args, **kwargs):
+        if load_config().get("admin_password_hash") and not session.get("admin"):
+            return redirect(url_for("entrar", next=request.path))
+        return view(*args, **kwargs)
+    return wrapper
+
+@app.context_processor
+def inject_globals():
+    cfg = load_config()
+    return {"has_password": bool(cfg.get("admin_password_hash")), "is_admin": bool(session.get("admin"))}
+
+@app.route("/entrar", methods=["GET", "POST"])
+def entrar():
+    cfg = load_config()
+    if request.method == "POST":
+        if cfg.get("admin_password_hash") and check_password_hash(cfg["admin_password_hash"], request.form.get("password", "")):
+            session.permanent = True
+            session["admin"] = True
+            target = request.args.get("next", "")
+            return redirect(target if target.startswith("/") and not target.startswith("//") else url_for("ajustes"))
+        time.sleep(1)
+        flash("Contraseña incorrecta.")
+    return render_template("entrar.html")
+
+@app.route("/salir")
+def salir():
+    session.pop("admin", None)
+    return redirect(url_for("home"))
+
+# ---------------------------------------------------------------- web: monitor
+
+@app.route("/")
+def home():
+    return render_template("index.html", zones=ZONES, default_zone=DEFAULT_ZONE)
+
+def zone_arg():
+    zone = request.args.get("zona", DEFAULT_ZONE)
+    if zone not in ZONES:
+        raise ValueError("Zona desconocida")
+    return zone
+
+@app.route("/api/estado")
+def api_estado():
+    try:
+        zone = zone_arg()
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
     now = time.time()
-    day_start = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
-    month_start_dt = datetime.now().astimezone().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    month_start = month_start_dt.timestamp()
-    with connect() as c:
-        # Costs and consumption summed by sample deltas in chosen periods
-        today = c.execute("SELECT COALESCE(SUM(delta_kwh),0),COALESCE(SUM(energy_cost_eur),0) FROM measurements WHERE epoch>=?", (day_start,)).fetchone()
-        month = c.execute("SELECT COALESCE(SUM(delta_kwh),0),COALESCE(SUM(energy_cost_eur),0) FROM measurements WHERE epoch>=?", (month_start,)).fetchone()
-        allrow = c.execute("SELECT COALESCE(SUM(delta_kwh),0),COALESCE(SUM(energy_cost_eur),0) FROM measurements").fetchone()
-        latest = c.execute("SELECT * FROM measurements ORDER BY id DESC LIMIT 1").fetchone()
-        recent = c.execute("SELECT timestamp,act_power,total_kwh,delta_kwh,energy_cost_eur,pvpc_eur_mwh FROM measurements ORDER BY id DESC LIMIT 1000").fetchall()
-        price_now = c.execute("SELECT price_eur_mwh FROM pvpc_prices WHERE epoch<=? ORDER BY epoch DESC LIMIT 1", (int(now),)).fetchone()
-        price_count = c.execute("SELECT COUNT(*) FROM pvpc_prices").fetchone()[0]
-    # Full estimated invoice: measured energy cost + power term + meter rent + configurable extras; taxes applied.
-    # PVPC indicator 1001 already includes energy, access tolls and charges; it excludes taxes.
-    power_days_month = datetime.now().day
-    power_cost = (float(cfg["power_kw_p1"]) * float(cfg["power_price_p1_eur_kw_day"]) +
-                  float(cfg["power_kw_p2"]) * float(cfg["power_price_p2_eur_kw_day"])) * power_days_month
-    meter_cost = float(cfg["meter_rent_eur_day"]) * power_days_month
-    other_fixed = float(cfg["other_fixed_monthly_eur"]) * power_days_month / datetime.now().replace(day=28).day
-    energy_base = float(month[1])
-    discount = energy_base * float(cfg["extra_discount_pct"]) / 100.0
-    taxable_base = max(0.0, energy_base - discount) + power_cost + meter_cost + other_fixed
-    electricity_tax = taxable_base * float(cfg["electricity_tax_pct"]) / 100.0
-    vat_base = taxable_base + electricity_tax
-    vat = vat_base * float(cfg["vat_pct"]) / 100.0
-    month_total = vat_base + vat
-    return {
-        "today_kwh": float(today[0]), "today_energy_eur": float(today[1]),
-        "month_kwh": float(month[0]), "month_energy_eur": energy_base,
-        "all_kwh_logged": float(allrow[0]), "all_energy_eur_logged": float(allrow[1]),
-        "power_cost_month_to_date": power_cost, "meter_cost_month_to_date": meter_cost,
-        "other_fixed": other_fixed, "discount": discount, "taxable_base": taxable_base,
-        "electricity_tax": electricity_tax, "vat": vat, "month_total_estimate": month_total,
-        "price_now_eur_mwh": float(price_now[0]) if price_now else None,
-        "price_count": int(price_count), "config": cfg,
-        "latest": dict(zip(["id","timestamp","epoch","voltage","current","act_power","aprt_power","pf","freq","total_kwh","returned_kwh","delta_kwh","energy_cost_eur","pvpc_eur_mwh"], latest)) if latest else None,
-        "recent": [{"timestamp": r[0], "act_power": r[1], "total_kwh": r[2], "delta_kwh": r[3], "energy_cost_eur": r[4], "pvpc_eur_mwh": r[5]} for r in reversed(recent[-20:])]
-    }
+    localnow = datetime.now().astimezone()
+    daystart = day_start(localnow).timestamp()
+    monthstart = day_start(localnow).replace(day=1).timestamp()
+    with db(zone, rows=True) as c:
+        last = c.execute("SELECT * FROM measurements ORDER BY id DESC LIMIT 1").fetchone()
+        today = c.execute("SELECT COALESCE(SUM(kwh),0) k,COALESCE(SUM(cost_eur),0) e FROM hourly WHERE epoch>=?", (daystart,)).fetchone()
+        month = c.execute("SELECT COALESCE(SUM(kwh),0) k,COALESCE(SUM(cost_eur),0) e FROM hourly WHERE epoch>=?", (monthstart,)).fetchone()
+        recent = c.execute("SELECT timestamp,act_power,total_kwh,delta_kwh,energy_cost_eur,pvpc_eur_mwh FROM measurements ORDER BY id DESC LIMIT 20").fetchall()
+        power_hist = c.execute("SELECT timestamp,act_power,pvpc_eur_mwh FROM measurements ORDER BY id DESC LIMIT 180").fetchall()
+        daily_rows = c.execute("""SELECT substr(label,1,10) day, SUM(kwh) kwh FROM hourly WHERE epoch>=?
+            GROUP BY day ORDER BY day""", (day_start(localnow - timedelta(days=13)).timestamp(),)).fetchall()
+        hourly_rows = c.execute("SELECT substr(label,12,2) hour, SUM(kwh) kwh FROM hourly WHERE epoch>=? GROUP BY hour ORDER BY hour", (daystart,)).fetchall()
+        cost_hist = c.execute("SELECT label, SUM(cost_eur) OVER (ORDER BY epoch) cost FROM hourly WHERE epoch>=? ORDER BY epoch", (monthstart,)).fetchall()
+    with db() as c:
+        count = c.execute("SELECT COUNT(*) FROM pvpc_prices").fetchone()[0]
+    cfg = load_config()
+    bill = bill_for(zone, float(month["e"]), cfg, localnow)
+    dev = ZONES[zone]
+    latest = dict(last) if last else None
+    payer = next((z["name"] or k for k, z in ZONES.items() if z.get("fixed_costs")), "")
+    return jsonify(ok=bool(last) and zone in LAST_OK and now - LAST_OK[zone] < 60, zone=zone, zone_name=dev["name"],
+        ip=zone_connection(dev), error=ZONE_STATE.get(zone) or ZONE_ERRORS.get(zone, ""), latest=latest,
+        total_kwh=latest["total_kwh"] if latest else 0, returned_kwh=latest["returned_kwh"] if latest else 0,
+        today_kwh=float(today["k"]), today_energy_eur=float(today["e"]), month_kwh=float(month["k"]),
+        month_energy_eur=float(month["e"]), price_now=price_for_epoch(now), price_count=int(count),
+        fixed_costs_zone=payer, **bill,
+        cost_history=[{"time": r["label"][8:10] + " " + r["label"][11:13] + "h", "cost": r["cost"]} for r in cost_hist],
+        power_pvpc_history=[{"time": r["timestamp"][-8:-3], "power": r["act_power"], "price": r["pvpc_eur_mwh"]} for r in reversed(power_hist)],
+        daily_consumption=[{"day": r["day"], "kwh": float(r["kwh"])} for r in daily_rows],
+        hourly_consumption=[{"hour": r["hour"] + ":00", "kwh": float(r["kwh"])} for r in hourly_rows],
+        recent=[dict(r) for r in reversed(recent)],
+        alerts=active_alerts())
 
-PAGE = r"""<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Shelly Pro EM-50 · PVPC</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js"></script><style>
-*{box-sizing:border-box}body{margin:0;background:#0b1220;color:#edf4ff;font:15px system-ui,Arial}main{max-width:1200px;margin:auto;padding:22px}header{display:flex;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:20px}h1{margin:0;font-size:clamp(24px,4vw,34px)}h2{font-size:18px}p,.muted{color:#9aabc4}.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.card{background:#121d30;border:1px solid #25334b;border-radius:16px;padding:18px}.label{color:#9aabc4;font-size:13px}.value{font-size:clamp(24px,3vw,34px);font-weight:700;margin-top:8px}.unit{font-size:14px;color:#9aabc4}.small{font-size:12px;color:#9aabc4;margin-top:8px}.full{grid-column:1/-1}.chart{height:280px}table{width:100%;border-collapse:collapse}td,th{text-align:left;padding:8px;border-bottom:1px solid #25334b;white-space:nowrap}th{color:#9aabc4}a{color:#54d6a0}.status{border:1px solid #25334b;border-radius:25px;padding:8px 12px;color:#9aabc4}button{background:#23644f;border:0;color:white;border-radius:9px;padding:10px 14px;cursor:pointer}.warn{color:#ffd479}.row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
-@media(max-width:760px){main{padding:12px}.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.value{font-size:25px}}@media(max-width:430px){.grid{grid-template-columns:1fr}.full{grid-column:auto}}
-</style></head><body><main>
-<header><div><h1 id="pageTitle">Consumo eléctrico · Zona principal</h1><p>Lecturas de Shelly + PVPC horario + estimación de factura</p><div class="row"><label for="zoneSelect">Zona:</label><select id="zoneSelect" onchange="changeZone()" style="padding:9px;border-radius:8px;background:#121d30;color:#edf4ff;border:1px solid #344761"><option value="principal">Principal · Shelly Pro EM-50</option><option value="acuario">Acuario · Shelly PM Mini Gen 3</option><option value="schneider">Schneider PowerLogic PM710</option></select><span class="small" id="deviceIp">IP: 192.168.4.175</span></div></div><div class="status" id="status">Cargando…</div></header>
-<section class="grid">
-<div class="card"><div class="label">Potencia actual</div><div class="value" id="power">— W</div><div class="small" id="updated"></div></div>
-<div class="card"><div class="label">Contador real consumido</div><div class="value" id="total">— kWh</div><div class="small">Contador interno del Shelly</div></div>
-<div class="card"><div class="label">PVPC hora actual</div><div class="value" id="price">— €/kWh</div><div class="small">Indicador PVPC de REE/ESIOS, antes de impuestos</div></div>
-<div class="card"><div class="label">Consumo de hoy</div><div class="value" id="today">— kWh</div><div class="small">Registrado por esta aplicación</div></div>
-<div class="card"><div class="label">Coste energía hoy</div><div class="value" id="todaycost">— €</div><div class="small">Solo energía registrada y con precio disponible</div></div>
-<div class="card"><div class="label">Consumo mes actual</div><div class="value" id="monthkwh">— kWh</div></div>
-<div class="card"><div class="label">Coste energía mes</div><div class="value" id="monthenergy">— €</div><div class="small">Sin impuestos ni término fijo</div></div>
-<div class="card"><div class="label">Factura estimada del mes</div><div class="value" id="bill">— €</div><div class="small">Incluye término fijo e impuestos configurados</div></div>
-<div class="card"><div class="label">Energía devuelta total</div><div class="value" id="returned">— kWh</div></div>
-<div class="card full"><h2>Potencia actual y precio PVPC</h2><div class="chart"><canvas id="powerPvpcChart"></canvas></div><p class="small">Potencia en W y PVPC en €/kWh, con escalas independientes. Histórico de las últimas lecturas guardadas.</p></div>
-<div class="card"><h2>Consumo por día</h2><div class="chart"><canvas id="dailyChart"></canvas></div><p class="small">Consumo diario en kWh. Días con datos guardados en esta zona.</p></div>
-<div class="card"><h2>Consumo por hora · hoy</h2><div class="chart"><canvas id="hourlyChart"></canvas></div><p class="small">Suma del consumo registrado en cada hora del día actual.</p></div>
-<div class="card full"><h2>Coste estimado acumulado del mes</h2><div class="chart"><canvas id="costChart"></canvas></div><p class="small">El coste horario se acumula cuando la aplicación está funcionando y el precio horario está disponible.</p></div>
-<div class="card full"><h2>Desglose estimado de factura</h2><div style="overflow:auto"><table><tbody id="billrows"></tbody></table></div></div>
-<div class="card full"><h2>Últimas lecturas</h2><p><a id="exportLink" href="/exportar.csv?zona=principal">Descargar CSV de esta zona</a> · <a id="historyLink" href="/historico?zona=principal">Consultar histórico</a> · <a href="/ajustes">Configurar tarifa y token PVPC</a></p><div style="overflow:auto"><table><thead><tr><th>Fecha/hora</th><th>W</th><th>Contador kWh</th><th>Delta kWh</th><th>Precio €/MWh</th><th>Coste energía €</th></tr></thead><tbody id="rows"></tbody></table></div></div>
-</section><p class="small">Fuente de precios: <a href="https://www.esios.ree.es/" target="_blank" rel="noreferrer">Red Eléctrica de España · ESIOS</a>. El indicador PVPC incluye energía, peajes y cargos, pero no impuestos. La factura completa es aproximada y depende de los datos configurados y de que el histórico esté completo.</p>
-</main>
-<script>
-const f=(v,n=3)=>v==null?'—':Number(v).toLocaleString('es-ES',{minimumFractionDigits:0,maximumFractionDigits:n});
-const eur=v=>v==null?'—':f(v,2)+' €';
-let currentZone='principal';function changeZone(){currentZone=document.getElementById('zoneSelect').value;document.getElementById('pageTitle').textContent=currentZone==='acuario'?'Consumo eléctrico · Acuario':(currentZone==='schneider'?'Consumo eléctrico · Schneider PM710':'Consumo eléctrico · Zona principal');document.getElementById('deviceIp').textContent='Conexión: '+(currentZone==='acuario'?'192.168.4.203':(currentZone==='schneider'?'192.168.100.206:502 · Modbus TCP · Slave ID 1':'192.168.4.175'));document.getElementById('exportLink').href='/exportar.csv?zona='+encodeURIComponent(currentZone);document.getElementById('historyLink').href='/historico?zona='+encodeURIComponent(currentZone);update();}
-const chartOptions={responsive:true,maintainAspectRatio:false,animation:false,interaction:{mode:'index',intersect:false},plugins:{legend:{labels:{color:'#edf4ff'}}},scales:{x:{ticks:{color:'#9aabc4',maxTicksLimit:10},grid:{color:'#25334b'}},y:{beginAtZero:true,ticks:{color:'#9aabc4'},grid:{color:'#25334b'}}}};
-const powerPvpcChart=new Chart(document.getElementById('powerPvpcChart'),{type:'line',data:{labels:[],datasets:[
-{label:'Potencia (W)',data:[],yAxisID:'yPower',borderColor:'#54d6a0',backgroundColor:'#54d6a022',fill:false,tension:.2,pointRadius:0},
-{label:'PVPC (€/kWh)',data:[],yAxisID:'yPrice',borderColor:'#ffd479',backgroundColor:'#ffd47922',fill:false,tension:.2,pointRadius:0}
-]},options:{...chartOptions,scales:{x:chartOptions.scales.x,yPower:{type:'linear',position:'left',beginAtZero:true,title:{display:true,text:'Potencia (W)',color:'#54d6a0'},ticks:{color:'#9aabc4'},grid:{color:'#25334b'}},yPrice:{type:'linear',position:'right',beginAtZero:true,title:{display:true,text:'PVPC (€/kWh)',color:'#ffd479'},ticks:{color:'#9aabc4'},grid:{drawOnChartArea:false}}}}});
-const dailyChart=new Chart(document.getElementById('dailyChart'),{type:'bar',data:{labels:[],datasets:[{label:'Consumo (kWh)',data:[],backgroundColor:'#54d6a0'}]},options:chartOptions});
-const hourlyChart=new Chart(document.getElementById('hourlyChart'),{type:'bar',data:{labels:[],datasets:[{label:'Consumo (kWh)',data:[],backgroundColor:'#6da9ff'}]},options:chartOptions});
-const costChart=new Chart(document.getElementById('costChart'),{type:'line',data:{labels:[],datasets:[{label:'Coste de energía acumulado (€)',data:[],borderColor:'#54d6a0',backgroundColor:'#54d6a022',fill:true,tension:.2,pointRadius:0}]},options:chartOptions});
-async function update(){try{const j=await(await fetch('/api/estado?zona='+encodeURIComponent(currentZone))).json();document.getElementById('status').textContent=j.ok?'Conectado · '+j.ip:(j.error?'Error · '+j.error:'Sin lectura todavía · '+j.ip);let d=j.latest||{};document.getElementById('power').textContent=f(d.act_power,1)+' W';document.getElementById('total').textContent=f(j.total_kwh,3)+' kWh';document.getElementById('returned').textContent=f(j.returned_kwh,3)+' kWh';document.getElementById('price').textContent=j.price_now==null?'Sin precio':f(j.price_now/1000,5)+' €/kWh';document.getElementById('updated').textContent=d.timestamp?'Actualizado '+d.timestamp:'';document.getElementById('today').textContent=f(j.today_kwh,3)+' kWh';document.getElementById('todaycost').textContent=eur(j.today_energy_eur);document.getElementById('monthkwh').textContent=f(j.month_kwh,3)+' kWh';document.getElementById('monthenergy').textContent=eur(j.month_energy_eur);document.getElementById('bill').textContent=eur(j.month_total_estimate);document.getElementById('billrows').innerHTML=[['Energía PVPC registrada',j.month_energy_eur],['Término potencia (estimado)',j.power_cost],['Alquiler contador',j.meter_cost],['Otros costes fijos',j.other_fixed],['Descuento configurado',-j.discount],['Base antes de impuesto eléctrico',j.taxable_base],['Impuesto electricidad',j.electricity_tax],['IVA',j.vat],['TOTAL ESTIMADO',j.month_total_estimate]].map(r=>'<tr><td>'+r[0]+'</td><td>'+eur(r[1])+'</td></tr>').join('');document.getElementById('rows').innerHTML=j.recent.slice().reverse().map(x=>'<tr>'+[x.timestamp,f(x.act_power,1),f(x.total_kwh,3),f(x.delta_kwh,5),f(x.pvpc_eur_mwh,2),eur(x.energy_cost_eur)].map(v=>'<td>'+v+'</td>').join('')+'</tr>').join('');powerPvpcChart.data.labels=j.power_pvpc_history.map(x=>x.time);powerPvpcChart.data.datasets[0].data=j.power_pvpc_history.map(x=>x.power);powerPvpcChart.data.datasets[1].data=j.power_pvpc_history.map(x=>x.price==null?null:x.price/1000);powerPvpcChart.update();
-dailyChart.data.labels=j.daily_consumption.map(x=>x.day);dailyChart.data.datasets[0].data=j.daily_consumption.map(x=>x.kwh);dailyChart.update();
-hourlyChart.data.labels=j.hourly_consumption.map(x=>x.hour);hourlyChart.data.datasets[0].data=j.hourly_consumption.map(x=>x.kwh);hourlyChart.update();
-costChart.data.labels=j.cost_history.map(x=>x.time);costChart.data.datasets[0].data=j.cost_history.map(x=>x.cost);costChart.update();if(j.price_count===0)document.getElementById('status').textContent='Esperando precios PVPC';}catch(e){document.getElementById('status').textContent='Error de conexión web';}}
-update();setInterval(update,5000);
-</script></body></html>"""
+def active_alerts(limit=10):
+    with db(rows=True) as c:
+        rows = c.execute("""SELECT epoch,zone,kind,message,active FROM alerts
+            WHERE active=1 OR epoch>=? ORDER BY active DESC, epoch DESC LIMIT ?""", (time.time() - 86400, limit)).fetchall()
+    return [{"time": local_stamp(r["epoch"])[:16], "zone": r["zone"], "kind": r["kind"], "message": r["message"],
+             "active": bool(r["active"])} for r in rows]
 
-SETTINGS = r"""<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Ajustes PVPC</title><style>
-body{margin:0;background:#0b1220;color:#edf4ff;font:15px system-ui,Arial}.wrap{max-width:800px;margin:25px auto;padding:18px}.card{background:#121d30;border:1px solid #25334b;border-radius:16px;padding:22px}h1{margin-top:0}label{display:block;color:#b5c4d9;font-size:13px;margin:14px 0 5px}input{width:100%;padding:11px;border-radius:8px;border:1px solid #344761;background:#0b1220;color:white}button{margin-top:18px;padding:11px 16px;border:0;border-radius:8px;background:#23644f;color:white;cursor:pointer}a{color:#54d6a0}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.hint{color:#9aabc4;font-size:13px;line-height:1.5}.msg{color:#ffd479}@media(max-width:600px){.grid{grid-template-columns:1fr}}
-</style></head><body><div class="wrap"><div class="card"><h1>Ajustes de tarifa PVPC</h1><p class="hint">Los precios horarios se consultan en REE/ESIOS mediante el indicador 1001 para Península (geo_id 8741). El token personal de ESIOS es opcional para el PVPC básico; se guarda localmente en config.json. El token se guarda localmente en config.json.</p>{% with messages = get_flashed_messages() %}{% if messages %}<p class="msg">{{ messages[0] }}</p>{% endif %}{% endwith %}
-<form method="post">
-<label>Token personal ESIOS</label><input name="esios_token" type="password" value="{{ cfg.esios_token }}" autocomplete="off" placeholder="Pega aquí tu token de ESIOS">
-<div class="grid">
-<div><label>Potencia contratada P1 (kW)</label><input name="power_kw_p1" type="number" step="0.01" value="{{ cfg.power_kw_p1 }}"></div>
-<div><label>Potencia contratada P2 (kW)</label><input name="power_kw_p2" type="number" step="0.01" value="{{ cfg.power_kw_p2 }}"></div>
-<div><label>Precio potencia P1 (€/kW/día, según factura)</label><input name="power_price_p1_eur_kw_day" type="number" step="0.000001" value="{{ cfg.power_price_p1_eur_kw_day }}"></div>
-<div><label>Precio potencia P2 (€/kW/día, según factura)</label><input name="power_price_p2_eur_kw_day" type="number" step="0.000001" value="{{ cfg.power_price_p2_eur_kw_day }}"></div>
-<div><label>Alquiler contador (€/día)</label><input name="meter_rent_eur_day" type="number" step="0.0001" value="{{ cfg.meter_rent_eur_day }}"></div>
-<div><label>Otros costes fijos (€/mes)</label><input name="other_fixed_monthly_eur" type="number" step="0.01" value="{{ cfg.other_fixed_monthly_eur }}"></div>
-<div><label>Impuesto electricidad (%)</label><input name="electricity_tax_pct" type="number" step="0.000001" value="{{ cfg.electricity_tax_pct }}"></div>
-<div><label>IVA (%)</label><input name="vat_pct" type="number" step="0.01" value="{{ cfg.vat_pct }}"></div>
-<div><label>Descuento sobre energía (%)</label><input name="extra_discount_pct" type="number" step="0.01" value="{{ cfg.extra_discount_pct }}"></div>
-</div><p class="hint">Los precios de potencia, alquiler e impuestos son editables: comprueba tu factura y ajusta los valores a los que te aplique tu comercializadora. El término de energía PVPC del indicador 1001 incluye peajes/cargos y coste de energía, pero excluye impuestos.</p><button type="submit">Guardar ajustes y actualizar precios</button></form><p><a href="/">← Volver al monitor</a></p></div></div></body></html>"""
+@app.route("/api/avisos")
+def api_avisos():
+    with db(rows=True) as c:
+        rows = c.execute("SELECT * FROM alerts ORDER BY epoch DESC LIMIT 200").fetchall()
+    return jsonify([{**dict(r), "time": local_stamp(r["epoch"]),
+                     "resolved": local_stamp(r["resolved_epoch"]) if r["resolved_epoch"] else None} for r in rows])
 
-HISTORY = r"""<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Histórico de consumo</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script><style>
-*{box-sizing:border-box}body{margin:0;background:#0b1220;color:#edf4ff;font:15px system-ui,Arial}main{max-width:1200px;margin:auto;padding:22px}header{margin-bottom:16px}h1{margin:0 0 6px;font-size:clamp(24px,4vw,34px)}h2{font-size:18px;margin-top:0}p,.muted{color:#9aabc4}.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.card{background:#121d30;border:1px solid #25334b;border-radius:16px;padding:18px}.label{color:#9aabc4;font-size:13px}.value{font-size:clamp(22px,3vw,30px);font-weight:700;margin-top:8px}.small{font-size:12px;color:#9aabc4;margin-top:8px}.full{grid-column:1/-1}.chart{height:300px}table{width:100%;border-collapse:collapse}td,th{text-align:left;padding:7px 8px;border-bottom:1px solid #25334b;white-space:nowrap}th{color:#9aabc4}a{color:#54d6a0}button{background:#23644f;border:0;color:white;border-radius:9px;padding:9px 13px;cursor:pointer}button.alt{background:#1d2a40;border:1px solid #344761}select,input{padding:9px;border-radius:8px;background:#0b1220;color:#edf4ff;border:1px solid #344761}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:end}.row label{display:flex;flex-direction:column;gap:4px;font-size:13px;color:#9aabc4}.warn{color:#ffd479}
-@media(max-width:760px){main{padding:12px}.grid{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:430px){.grid{grid-template-columns:minmax(0,1fr)}.full{grid-column:auto}}.card{min-width:0}
-</style></head><body><main>
-<header><h1>Histórico de consumo</h1><p><a href="/">← Volver al monitor</a> · <span id="available">Cargando…</span></p></header>
-<section class="card" style="margin-bottom:14px"><div class="row">
-<label>Zona<select id="zona">{% for key, z in zones.items() %}<option value="{{ key }}">{{ z.name }}</option>{% endfor %}</select></label>
-<label>Desde<input type="date" id="desde"></label><label>Hasta<input type="date" id="hasta"></label>
-<label>Agrupar por<select id="agrupar"><option value="auto">Automático</option><option value="hora">Hora</option><option value="dia">Día</option><option value="mes">Mes</option></select></label>
-<button onclick="load()">Consultar</button></div>
-<div class="row" style="margin-top:10px"><button class="alt" onclick="preset('hoy')">Hoy</button><button class="alt" onclick="preset('ayer')">Ayer</button><button class="alt" onclick="preset('7d')">Últimos 7 días</button><button class="alt" onclick="preset('30d')">Últimos 30 días</button><button class="alt" onclick="preset('mes')">Este mes</button><button class="alt" onclick="preset('mesant')">Mes anterior</button><button class="alt" onclick="preset('todo')">Todo</button></div></section>
-<section class="grid">
-<div class="card"><div class="label">Consumo del periodo</div><div class="value" id="kwh">—</div></div>
-<div class="card"><div class="label">Coste de energía</div><div class="value" id="cost">—</div><div class="small">PVPC sin impuestos ni término fijo</div></div>
-<div class="card"><div class="label">Precio medio pagado</div><div class="value" id="avgprice">—</div><div class="small">Coste / consumo con precio disponible</div></div>
-<div class="card"><div class="label">Potencia máxima</div><div class="value" id="maxpower">—</div><div class="small" id="maxpowerat"></div></div>
-<div class="card"><div class="label">Potencia media</div><div class="value" id="avgpower">—</div></div>
-<div class="card"><div class="label">Lecturas guardadas</div><div class="value" id="readings">—</div><div class="small" id="coverage"></div></div>
-<div class="card full"><h2>Consumo y precio PVPC</h2><div class="chart"><canvas id="energyChart"></canvas></div></div>
-<div class="card full"><h2>Coste de energía</h2><div class="chart"><canvas id="costChart"></canvas></div></div>
-<div class="card full"><h2>Potencia</h2><div class="chart"><canvas id="powerChart"></canvas></div><p class="small" id="powerNote"></p></div>
-<div class="card full"><h2>Detalle</h2><p><a id="csvAgg" href="#">Descargar este detalle en CSV</a> · <a id="csvRaw" href="#">Descargar lecturas originales del periodo</a></p><div style="overflow:auto;max-height:520px"><table><thead><tr><th>Periodo</th><th>Consumo kWh</th><th>Coste €</th><th>Precio medio €/kWh</th><th>Potencia media W</th><th>Potencia máx. W</th><th>Lecturas</th></tr></thead><tbody id="rows"></tbody></table></div></div>
-<div class="card full"><h2>Huecos sin datos</h2><p class="small">Periodos de más de 5 minutos sin lecturas (la aplicación estaba parada o el medidor no respondía). El consumo de un hueco se registra todo junto en la primera lectura posterior.</p><div style="overflow:auto"><table><thead><tr><th>Desde</th><th>Hasta</th><th>Duración</th><th>Consumo acumulado kWh</th></tr></thead><tbody id="gaps"></tbody></table></div></div>
-</section></main>
-<script>
-const $=id=>document.getElementById(id);
-const f=(v,n=3)=>v==null?'—':Number(v).toLocaleString('es-ES',{minimumFractionDigits:0,maximumFractionDigits:n});
-const eur=v=>v==null?'—':f(v,2)+' €';
-const iso=d=>d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
-const dur=s=>{s=Math.round(s);const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return (d?d+' d ':'')+(h?h+' h ':'')+m+' min';};
-let info=null;
-function preset(p){const t=new Date();let a=new Date(t),b=new Date(t);
- if(p==='ayer'){a.setDate(t.getDate()-1);b=new Date(a);}
- else if(p==='7d')a.setDate(t.getDate()-6);
- else if(p==='30d')a.setDate(t.getDate()-29);
- else if(p==='mes')a=new Date(t.getFullYear(),t.getMonth(),1);
- else if(p==='mesant'){a=new Date(t.getFullYear(),t.getMonth()-1,1);b=new Date(t.getFullYear(),t.getMonth(),0);}
- else if(p==='todo'&&info&&info.first){a=new Date(info.first.slice(0,10)+'T00:00');b=new Date(info.last.slice(0,10)+'T00:00');}
- $('desde').value=iso(a);$('hasta').value=iso(b);load();}
-const opts={responsive:true,maintainAspectRatio:false,animation:false,interaction:{mode:'index',intersect:false},plugins:{legend:{labels:{color:'#edf4ff'}}},scales:{x:{ticks:{color:'#9aabc4',maxTicksLimit:14},grid:{color:'#25334b'}},y:{beginAtZero:true,ticks:{color:'#9aabc4'},grid:{color:'#25334b'}}}};
-const energyChart=new Chart($('energyChart'),{data:{labels:[],datasets:[
- {type:'bar',label:'Consumo (kWh)',data:[],yAxisID:'y',backgroundColor:'#54d6a0'},
- {type:'line',label:'PVPC medio (€/kWh)',data:[],yAxisID:'yPrice',borderColor:'#ffd479',backgroundColor:'#ffd479',pointRadius:0,tension:.2,spanGaps:true}]},
- options:{...opts,scales:{x:opts.scales.x,y:{...opts.scales.y,title:{display:true,text:'kWh',color:'#54d6a0'}},yPrice:{position:'right',beginAtZero:true,title:{display:true,text:'€/kWh',color:'#ffd479'},ticks:{color:'#9aabc4'},grid:{drawOnChartArea:false}}}}});
-const costChart=new Chart($('costChart'),{type:'bar',data:{labels:[],datasets:[{label:'Coste (€)',data:[],backgroundColor:'#6da9ff'}]},options:opts});
-const powerChart=new Chart($('powerChart'),{type:'line',data:{labels:[],datasets:[
- {label:'Potencia media (W)',data:[],borderColor:'#54d6a0',backgroundColor:'#54d6a022',fill:true,pointRadius:0,tension:.2},
- {label:'Potencia máxima (W)',data:[],borderColor:'#ff8a8a',pointRadius:0,tension:.2,borderWidth:1}]},options:opts});
-async function loadInfo(){const r=await fetch('/api/historico/rango?zona='+encodeURIComponent($('zona').value));info=await r.json();
- $('available').textContent=info.first?('Datos de esta zona desde '+info.first+' hasta '+info.last+' · '+f(info.count,0)+' lecturas'):'Esta zona todavía no tiene lecturas guardadas';}
-async function load(){const q=new URLSearchParams({zona:$('zona').value,desde:$('desde').value,hasta:$('hasta').value,agrupar:$('agrupar').value});
- history.replaceState(null,'','/historico?'+q);
- $('csvAgg').href='/exportar.csv?'+q;const raw=new URLSearchParams(q);raw.delete('agrupar');$('csvRaw').href='/exportar.csv?'+raw;
- const r=await fetch('/api/historico?'+q);const j=await r.json();if(!r.ok){$('available').innerHTML='<span class="warn">'+(j.error||'Error')+'</span>';return;}
- const t=j.totals;$('kwh').textContent=f(t.kwh,3)+' kWh';$('cost').textContent=eur(t.cost_eur);$('avgprice').textContent=t.avg_price_eur_kwh==null?'—':f(t.avg_price_eur_kwh,5)+' €/kWh';
- $('maxpower').textContent=t.max_power==null?'—':f(t.max_power,1)+' W';$('maxpowerat').textContent=t.max_power_at?'el '+t.max_power_at:'';$('avgpower').textContent=t.avg_power==null?'—':f(t.avg_power,1)+' W';
- $('readings').textContent=f(t.readings,0);$('coverage').textContent=t.readings?('Primera '+t.first+' · última '+t.last+(j.gaps.length?' · '+j.gaps.length+' huecos':'')):'Sin lecturas en este periodo';
- const lab=j.groups.map(g=>g.label);energyChart.data.labels=lab;energyChart.data.datasets[0].data=j.groups.map(g=>g.kwh);energyChart.data.datasets[1].data=j.groups.map(g=>g.avg_price_eur_kwh);energyChart.update();
- costChart.data.labels=lab;costChart.data.datasets[0].data=j.groups.map(g=>g.cost_eur);costChart.update();
- powerChart.data.labels=j.power.map(p=>p.time);powerChart.data.datasets[0].data=j.power.map(p=>p.avg);powerChart.data.datasets[1].data=j.power.map(p=>p.max);powerChart.update();
- $('powerNote').textContent='Cada punto resume '+dur(j.power_bucket_seconds)+' de lecturas.';
- $('rows').innerHTML=j.groups.map(g=>'<tr>'+[g.label,f(g.kwh,3),eur(g.cost_eur),g.avg_price_eur_kwh==null?'—':f(g.avg_price_eur_kwh,5),f(g.avg_power,1),f(g.max_power,1),f(g.readings,0)].map(v=>'<td>'+v+'</td>').join('')+'</tr>').join('')||'<tr><td colspan="7">Sin datos</td></tr>';
- $('gaps').innerHTML=j.gaps.map(g=>'<tr><td>'+g.from+'</td><td>'+g.to+'</td><td>'+dur(g.seconds)+'</td><td>'+f(g.kwh_after,3)+'</td></tr>').join('')||'<tr><td colspan="4">Sin huecos en este periodo</td></tr>';}
-$('zona').onchange=async()=>{await loadInfo();load();};
-(async()=>{const p=new URLSearchParams(location.search);if(p.get('zona'))$('zona').value=p.get('zona');if(p.get('agrupar'))$('agrupar').value=p.get('agrupar');
- await loadInfo();if(p.get('desde')&&p.get('hasta')){$('desde').value=p.get('desde');$('hasta').value=p.get('hasta');load();}else preset('7d');})();
-</script></body></html>"""
+# ---------------------------------------------------------------- web: histórico
 
-HISTORY_GROUPS = {"hora": (13, "%Y-%m-%d %H"), "dia": (10, "%Y-%m-%d"), "mes": (7, "%Y-%m")}
-GAP_SECONDS = 300
+HISTORY_GROUPS = {"hora": 13, "dia": 10, "mes": 7}
 
 def history_range(args):
     """Parse zona/desde/hasta/agrupar into local epochs. Raises ValueError with a user-facing message."""
@@ -480,33 +790,67 @@ def history_range(args):
         raise ValueError("Agrupación no válida")
     return zone, start.timestamp(), end.timestamp(), group
 
+def avg_price(cost, priced_kwh):
+    return cost / priced_kwh if priced_kwh else None
+
 def history_groups(c, start, end, group):
-    width = HISTORY_GROUPS[group][0]
-    rows = c.execute(f"""SELECT substr(timestamp,1,{width}) label, COALESCE(SUM(delta_kwh),0) kwh,
-        COALESCE(SUM(energy_cost_eur),0) cost, SUM(CASE WHEN pvpc_eur_mwh IS NOT NULL THEN delta_kwh ELSE 0 END) priced_kwh,
-        AVG(pvpc_eur_mwh) price, AVG(act_power) avg_power, MAX(act_power) max_power, COUNT(*) readings
-        FROM measurements WHERE epoch>=? AND epoch<? GROUP BY label ORDER BY label""", (start, end)).fetchall()
-    out = []
-    for r in rows:
-        # Energy-weighted price when there was consumption; plain hourly average otherwise.
-        price = r["cost"] / r["priced_kwh"] if r["priced_kwh"] else (r["price"] / 1000.0 if r["price"] is not None else None)
-        label = r["label"] + ":00" if group == "hora" else r["label"]
-        out.append({"label": label, "kwh": float(r["kwh"]), "cost_eur": float(r["cost"]), "avg_price_eur_kwh": price,
-                    "avg_power": r["avg_power"], "max_power": r["max_power"], "readings": r["readings"]})
-    return out
+    width = HISTORY_GROUPS[group]
+    rows = c.execute(f"""SELECT substr(label,1,{width}) lbl, SUM(kwh) kwh, SUM(cost_eur) cost, SUM(priced_kwh) priced,
+        SUM(power_sum)/NULLIF(SUM(power_n),0) avg_power, MAX(power_max) max_power, SUM(power_n) readings
+        FROM hourly WHERE epoch>=? AND epoch<? GROUP BY lbl ORDER BY lbl""", (start, end)).fetchall()
+    return [{"label": r["lbl"] + ":00" if group == "hora" else r["lbl"], "kwh": float(r["kwh"]),
+             "cost_eur": float(r["cost"]), "avg_price_eur_kwh": avg_price(r["cost"], r["priced"]),
+             "avg_power": r["avg_power"], "max_power": r["max_power"], "readings": r["readings"]} for r in rows]
+
+def period_totals(c, start, end):
+    t = c.execute("""SELECT COALESCE(SUM(kwh),0) kwh, COALESCE(SUM(cost_eur),0) cost, SUM(priced_kwh) priced,
+        SUM(power_sum)/NULLIF(SUM(power_n),0) avg_power, COALESCE(SUM(power_n),0) readings
+        FROM hourly WHERE epoch>=? AND epoch<?""", (start, end)).fetchone()
+    peak = c.execute("""SELECT power_max,power_max_at FROM hourly WHERE epoch>=? AND epoch<? AND power_max IS NOT NULL
+        ORDER BY power_max DESC LIMIT 1""", (start, end)).fetchone()
+    return {"kwh": float(t["kwh"]), "cost_eur": float(t["cost"]), "avg_price_eur_kwh": avg_price(t["cost"], t["priced"]),
+            "avg_power": t["avg_power"], "readings": t["readings"],
+            "max_power": peak["power_max"] if peak else None, "max_power_at": peak["power_max_at"] if peak else None}
+
+def zone_breakdown(start, end):
+    """Consumo de cada zona en el periodo; para las zonas que contienen otras, añade el resto no medido aparte."""
+    out = {}
+    for zone, dev in ZONES.items():
+        try:
+            with db(zone) as c:
+                kwh, cost = c.execute("SELECT COALESCE(SUM(kwh),0), COALESCE(SUM(cost_eur),0) FROM hourly WHERE epoch>=? AND epoch<?",
+                                      (start, end)).fetchone()
+        except sqlite3.Error:
+            kwh, cost = 0.0, 0.0
+        out[zone] = {"zone": zone, "name": dev["name"] or zone, "kwh": kwh, "cost_eur": cost, "parent": dev.get("parent") or ""}
+    rows = []
+    for zone, z in out.items():
+        if z["parent"]:
+            continue
+        rows.append(z)
+        children = [o for o in out.values() if o["parent"] == zone]
+        rows.extend(children)
+        if children:
+            rows.append({"zone": f"{zone}__resto", "name": f"Resto de {z['name']}", "parent": zone, "rest": True,
+                         "kwh": max(0.0, z["kwh"] - sum(ch["kwh"] for ch in children)),
+                         "cost_eur": max(0.0, z["cost_eur"] - sum(ch["cost_eur"] for ch in children))})
+    return rows
 
 @app.route("/historico")
 def historico():
-    return render_template_string(HISTORY, zones=ZONES)
+    return render_template("historico.html", zones=ZONES)
 
 @app.route("/api/historico/rango")
 def api_historico_rango():
-    zone = request.args.get("zona", DEFAULT_ZONE)
-    if zone not in ZONES:
-        return jsonify(error="Zona desconocida"), 400
-    with connect(zone) as c:
-        first, last, count = c.execute("SELECT MIN(timestamp),MAX(timestamp),COUNT(*) FROM measurements").fetchone()
-    return jsonify(zone=zone, first=first, last=last, count=count)
+    try:
+        zone = zone_arg()
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+    with db(zone) as c:
+        first, last = c.execute("SELECT MIN(label),MAX(label) FROM hourly").fetchone()
+        count = c.execute("SELECT COALESCE(SUM(power_n),0) FROM hourly").fetchone()[0]
+        raw_first = c.execute("SELECT MIN(timestamp) FROM measurements").fetchone()[0]
+    return jsonify(zone=zone, first=first and first + ":00", last=last and last + ":00", count=count, raw_first=raw_first)
 
 @app.route("/api/historico")
 def api_historico():
@@ -516,100 +860,32 @@ def api_historico():
         return jsonify(error=str(e)), 400
     # About 400 points in the power chart whatever the length of the period.
     bucket = max(POLL_SECONDS, int((end - start) / 400))
-    with connect(zone) as c:
-        c.row_factory = sqlite3.Row
+    prev_start = start - (end - start)
+    with db(zone, rows=True) as c:
         groups = history_groups(c, start, end, group)
-        t = c.execute("""SELECT COALESCE(SUM(delta_kwh),0) kwh, COALESCE(SUM(energy_cost_eur),0) cost,
-            SUM(CASE WHEN pvpc_eur_mwh IS NOT NULL THEN delta_kwh ELSE 0 END) priced_kwh, AVG(act_power) avg_power,
-            COUNT(*) readings, MIN(timestamp) first, MAX(timestamp) last
-            FROM measurements WHERE epoch>=? AND epoch<?""", (start, end)).fetchone()
-        peak = c.execute("SELECT act_power,timestamp FROM measurements WHERE epoch>=? AND epoch<? ORDER BY act_power DESC LIMIT 1", (start, end)).fetchone()
-        power = c.execute("""SELECT MIN(timestamp) time, AVG(act_power) avg, MAX(act_power) max FROM measurements
-            WHERE epoch>=? AND epoch<? GROUP BY CAST(epoch/? AS INTEGER) ORDER BY time""", (start, end, bucket)).fetchall()
+        totals = period_totals(c, start, end)
+        previous = period_totals(c, prev_start, start)
+        power = []
+        if bucket < 3600:
+            power = c.execute("""SELECT MIN(timestamp) time, AVG(act_power) avg, MAX(act_power) max FROM measurements
+                WHERE epoch>=? AND epoch<? GROUP BY CAST(epoch/? AS INTEGER) ORDER BY time""", (start, end, bucket)).fetchall()
+        if not power:
+            # Periodo largo o lecturas de 5 s ya borradas: se usa el resumen horario.
+            bucket = max(3600, bucket // 3600 * 3600)
+            power = c.execute("""SELECT MIN(label)||':00:00' time, SUM(power_sum)/NULLIF(SUM(power_n),0) avg, MAX(power_max) max
+                FROM hourly WHERE epoch>=? AND epoch<? AND power_n>0 GROUP BY CAST(epoch/? AS INTEGER) ORDER BY epoch""",
+                (start, end, bucket)).fetchall()
         gaps = c.execute("""SELECT prev_ts, timestamp, epoch-prev_epoch secs, delta_kwh FROM (
               SELECT timestamp, epoch, delta_kwh, LAG(epoch) OVER (ORDER BY epoch) prev_epoch, LAG(timestamp) OVER (ORDER BY epoch) prev_ts
               FROM measurements WHERE epoch>=? AND epoch<?) WHERE epoch-prev_epoch>? ORDER BY epoch""", (start, end, GAP_SECONDS)).fetchall()
+        raw_first = c.execute("SELECT MIN(epoch) FROM measurements").fetchone()[0]
     short = bucket < 86400
-    return jsonify(zone=zone, group=group, groups=groups, power_bucket_seconds=bucket,
-        totals={"kwh": float(t["kwh"]), "cost_eur": float(t["cost"]),
-                "avg_price_eur_kwh": t["cost"] / t["priced_kwh"] if t["priced_kwh"] else None,
-                "avg_power": t["avg_power"], "readings": t["readings"], "first": t["first"], "last": t["last"],
-                "max_power": peak["act_power"] if peak else None, "max_power_at": peak["timestamp"] if peak else None},
+    return jsonify(zone=zone, group=group, groups=groups, power_bucket_seconds=bucket, totals=totals,
+        previous={**previous, "from": local_stamp(prev_start)[:10], "to": local_stamp(start - 1)[:10]},
+        zones=zone_breakdown(start, end),
+        gaps_complete=raw_first is None or raw_first <= start + GAP_SECONDS,
         power=[{"time": (r["time"][5:16] if short else r["time"][:10]), "avg": r["avg"], "max": r["max"]} for r in power],
         gaps=[{"from": g["prev_ts"], "to": g["timestamp"], "seconds": g["secs"], "kwh_after": g["delta_kwh"]} for g in gaps])
-
-@app.route("/")
-def home():
-    return render_template_string(PAGE)
-
-@app.route("/ajustes", methods=["GET","POST"])
-def ajustes():
-    cfg = load_config()
-    if request.method == "POST":
-        try:
-            cfg["esios_token"] = request.form.get("esios_token","").strip()
-            for key in ["power_kw_p1","power_kw_p2","power_price_p1_eur_kw_day","power_price_p2_eur_kw_day","meter_rent_eur_day","other_fixed_monthly_eur","electricity_tax_pct","vat_pct","extra_discount_pct"]:
-                cfg[key] = float(request.form.get(key, DEFAULTS[key]))
-            save_config(cfg)
-            try:
-                n = fetch_pvpc(datetime.now().astimezone()-timedelta(days=2), datetime.now().astimezone()+timedelta(days=2))
-                flash(f"Ajustes guardados. Precios horarios cargados: {n}.")
-            except Exception as e:
-                flash(f"Ajustes guardados, pero no se pudieron descargar precios PVPC: {e}")
-        except Exception as e:
-            flash(f"No se pudieron guardar los ajustes: {e}")
-        return redirect(url_for("ajustes"))
-    return render_template_string(SETTINGS, cfg=cfg)
-
-@app.route("/api/estado")
-def api_estado():
-    zone = request.args.get("zona", DEFAULT_ZONE)
-    if zone not in ZONES:
-        return jsonify(error="Zona desconocida"), 400
-    now = time.time()
-    localnow = datetime.now().astimezone()
-    daystart = localnow.replace(hour=0,minute=0,second=0,microsecond=0).timestamp()
-    monthstart = localnow.replace(day=1,hour=0,minute=0,second=0,microsecond=0).timestamp()
-    with connect(zone) as c:
-        c.row_factory = sqlite3.Row
-        last = c.execute("SELECT * FROM measurements ORDER BY id DESC LIMIT 1").fetchone()
-        today = c.execute("SELECT COALESCE(SUM(delta_kwh),0) k,COALESCE(SUM(energy_cost_eur),0) e FROM measurements WHERE epoch>=?",(daystart,)).fetchone()
-        month = c.execute("SELECT COALESCE(SUM(delta_kwh),0) k,COALESCE(SUM(energy_cost_eur),0) e FROM measurements WHERE epoch>=?",(monthstart,)).fetchone()
-        recent = c.execute("SELECT timestamp,act_power,total_kwh,delta_kwh,energy_cost_eur,pvpc_eur_mwh FROM measurements ORDER BY id DESC LIMIT 20").fetchall()
-        power_hist = c.execute("SELECT timestamp,act_power,pvpc_eur_mwh FROM measurements ORDER BY id DESC LIMIT 180").fetchall()
-        daily_rows = c.execute("""SELECT substr(timestamp,1,10) day, COALESCE(SUM(delta_kwh),0) kwh
-            FROM measurements WHERE delta_kwh>=0 GROUP BY substr(timestamp,1,10) ORDER BY day DESC LIMIT 14""").fetchall()
-        hourly_rows = c.execute("""SELECT substr(timestamp,12,2) hour, COALESCE(SUM(delta_kwh),0) kwh
-            FROM measurements WHERE epoch>=? AND delta_kwh>=0 GROUP BY substr(timestamp,12,2) ORDER BY hour""",(daystart,)).fetchall()
-        cost_hist = c.execute("SELECT timestamp, SUM(energy_cost_eur) OVER (ORDER BY id) AS cost FROM measurements WHERE epoch>=? ORDER BY epoch",(monthstart,)).fetchall()
-    # Shared PVPC table is kept in the original database.
-    with connect() as c:
-        count = c.execute("SELECT COUNT(*) FROM pvpc_prices").fetchone()[0]
-        price_now = c.execute("SELECT price_eur_mwh FROM pvpc_prices WHERE epoch<=? ORDER BY epoch DESC LIMIT 1",(int(now),)).fetchone()
-    cfg = load_config()
-    days_elapsed = localnow.day
-    power_cost = (cfg["power_kw_p1"]*cfg["power_price_p1_eur_kw_day"] + cfg["power_kw_p2"]*cfg["power_price_p2_eur_kw_day"]) * days_elapsed
-    meter_cost = cfg["meter_rent_eur_day"] * days_elapsed
-    month_days = (localnow.replace(day=28)+timedelta(days=4)).replace(day=1).day
-    other_fixed = cfg["other_fixed_monthly_eur"] * days_elapsed / month_days
-    energy_base = float(month["e"])
-    discount = energy_base * cfg["extra_discount_pct"] / 100.0
-    taxable = max(0,energy_base-discount) + power_cost + meter_cost + other_fixed
-    elec_tax = taxable * cfg["electricity_tax_pct"] / 100.0
-    vat = (taxable + elec_tax) * cfg["vat_pct"] / 100.0
-    bill = taxable + elec_tax + vat
-    latest = dict(last) if last else None
-    return jsonify(ok=bool(last),zone=zone,zone_name=ZONES[zone]["name"],ip=ZONES[zone]["ip"],error=ZONE_ERRORS.get(zone, ""),latest=latest,
-        total_kwh=latest["total_kwh"] if latest else 0, returned_kwh=latest["returned_kwh"] if latest else 0,
-        today_kwh=float(today["k"]),today_energy_eur=float(today["e"]),month_kwh=float(month["k"]),
-        month_energy_eur=energy_base,price_now=float(price_now[0]) if price_now else None,
-        price_count=int(count),power_cost=power_cost,meter_cost=meter_cost,other_fixed=other_fixed,discount=discount,
-        taxable_base=taxable,electricity_tax=elec_tax,vat=vat,month_total_estimate=bill,
-        cost_history=[{"time":r["timestamp"][-8:-3],"cost":r["cost"]} for r in cost_hist[::max(1,len(cost_hist)//200)]],
-        power_pvpc_history=[{"time":r["timestamp"][-8:-3],"power":r["act_power"],"price":r["pvpc_eur_mwh"]} for r in reversed(power_hist)],
-        daily_consumption=[{"day":r["day"],"kwh":float(r["kwh"])} for r in reversed(daily_rows)],
-        hourly_consumption=[{"hour":r["hour"]+":00","kwh":float(r["kwh"])} for r in hourly_rows],
-        recent=[dict(r) for r in reversed(recent)])
 
 @app.route("/exportar.csv")
 def export_csv():
@@ -626,27 +902,165 @@ def export_csv():
         suffix = f"_{request.args['desde']}_{request.args['hasta']}"
         if "agrupar" not in request.args:
             group = None
-    out=io.StringIO(); w=csv.writer(out)
-    with connect(zone) as c:
+    out = io.StringIO(); w = csv.writer(out)
+    with db(zone, rows=True) as c:
         if group:
-            c.row_factory = sqlite3.Row
-            w.writerow(["periodo","consumo_kWh","coste_energia_EUR","precio_medio_EUR_kWh","potencia_media_W","potencia_max_W","lecturas"])
-            w.writerows([[g["label"],g["kwh"],g["cost_eur"],g["avg_price_eur_kwh"],g["avg_power"],g["max_power"],g["readings"]] for g in history_groups(c, start, end, group)])
+            w.writerow(["periodo", "consumo_kWh", "coste_energia_EUR", "precio_medio_EUR_kWh", "potencia_media_W", "potencia_max_W", "lecturas"])
+            w.writerows([[g["label"], g["kwh"], g["cost_eur"], g["avg_price_eur_kwh"], g["avg_power"], g["max_power"], g["readings"]]
+                         for g in history_groups(c, start, end, group)])
             suffix += f"_por_{group}"
         else:
-            rows=c.execute("SELECT timestamp,voltage,current,act_power,aprt_power,pf,freq,total_kwh,returned_kwh,delta_kwh,pvpc_eur_mwh,energy_cost_eur FROM measurements WHERE epoch>=? AND epoch<? ORDER BY id",(start,end)).fetchall()
-            w.writerow(["fecha_hora","tension_V","corriente_A","potencia_W","potencia_aparente_VA","factor_potencia","frecuencia_Hz","energia_consumida_total_kWh","energia_devuelta_total_kWh","delta_consumo_kWh","PVPC_EUR_MWh","coste_energia_EUR"])
-            w.writerows(rows)
-    return Response("\ufeff"+out.getvalue(),mimetype="text/csv",headers={"Content-Disposition":f"attachment; filename=shelly_pvpc_historico_{zone}{suffix}.csv"})
+            rows = c.execute("SELECT timestamp,voltage,current,act_power,aprt_power,pf,freq,total_kwh,returned_kwh,delta_kwh,pvpc_eur_mwh,energy_cost_eur FROM measurements WHERE epoch>=? AND epoch<? ORDER BY id", (start, end)).fetchall()
+            w.writerow(["fecha_hora", "tension_V", "corriente_A", "potencia_W", "potencia_aparente_VA", "factor_potencia", "frecuencia_Hz", "energia_consumida_total_kWh", "energia_devuelta_total_kWh", "delta_consumo_kWh", "PVPC_EUR_MWh", "coste_energia_EUR"])
+            w.writerows([tuple(r) for r in rows])
+    return Response("﻿" + out.getvalue(), mimetype="text/csv",
+                    headers={"Content-Disposition": f"attachment; filename=shelly_pvpc_historico_{zone}{suffix}.csv"})
 
-if __name__=="__main__":
-    init_db()
+# ---------------------------------------------------------------- web: ajustes
+
+TARIFF_FIELDS = ["power_kw_p1", "power_kw_p2", "power_price_p1_eur_kw_day", "power_price_p2_eur_kw_day",
+                 "meter_rent_eur_day", "other_fixed_monthly_eur", "electricity_tax_pct", "vat_pct", "extra_discount_pct"]
+
+def parse_zones(form, old_zones):
+    """Lee la tabla de equipos del formulario. Lanza ValueError con un mensaje para el usuario."""
+    zones = {}
+    for i in range(int(form.get("zone_count", 0))):
+        f = lambda name, default="": form.get(f"z{i}_{name}", default).strip()
+        key = f("key").lower()
+        if not key:
+            continue
+        if f("delete"):
+            if key == DEFAULT_ZONE:
+                raise ValueError("La zona principal no se puede borrar (guarda los precios PVPC).")
+            continue
+        if not ZONE_KEY_RE.match(key):
+            raise ValueError(f"Identificador de zona no válido: «{key}». Usa minúsculas, números y _.")
+        if key in zones:
+            raise ValueError(f"La zona «{key}» está repetida.")
+        model = f("model")
+        if model not in MODELS:
+            raise ValueError(f"Modelo no válido en la zona «{key}».")
+        if not f("ip"):
+            raise ValueError(f"Falta la IP de la zona «{key}».")
+        try:
+            zone = {**ZONE_DEFAULTS, **old_zones.get(key, {}),
+                    "name": f("name") or key, "model": model, "ip": f("ip"),
+                    "port": int(f("port", "502") or 502), "slave_id": int(f("slave_id", "1") or 1),
+                    "voltage": "ln" if f("voltage") == "ln" else "ll",
+                    "fixed_costs": bool(f("fixed_costs")), "enabled": bool(f("enabled")), "parent": f("parent"),
+                    "power_alert_w": max(0.0, float(f("power_alert_w", "0") or 0)),
+                    "power_alert_minutes": max(1.0, float(f("power_alert_minutes", "2") or 2))}
+        except ValueError:
+            raise ValueError(f"Hay un número no válido en la zona «{key}».")
+        zones[key] = zone
+    if DEFAULT_ZONE not in zones:
+        raise ValueError("Falta la zona principal.")
+    for key, z in zones.items():
+        if z["parent"] and (z["parent"] not in zones or z["parent"] == key):
+            z["parent"] = ""
+    # Only one level: a zone that contains others can't be inside another one.
+    for z in zones.values():
+        if z["parent"] and zones[z["parent"]]["parent"]:
+            raise ValueError(f"«{zones[z['parent']]['name']}» está dentro de otra zona y no puede contener a «{z['name']}».")
+    return zones
+
+@app.route("/ajustes", methods=["GET", "POST"])
+@admin_required
+def ajustes():
+    cfg = load_config()
+    if request.method == "POST":
+        form = request.form
+        try:
+            for key in TARIFF_FIELDS:
+                cfg[key] = float(form.get(key, DEFAULTS[key]))
+            new_token = form.get("esios_token", "").strip()
+            if form.get("esios_token_delete"):
+                cfg["esios_token"] = ""
+            elif new_token:
+                cfg["esios_token"] = new_token
+            cfg["zones"] = parse_zones(form, cfg["zones"])
+            cfg["raw_retention_days"] = max(0, int(form.get("raw_retention_days", 0) or 0))
+            new_tg = form.get("telegram_token", "").strip()
+            if form.get("telegram_token_delete"):
+                cfg["telegram_token"] = ""
+            elif new_tg:
+                cfg["telegram_token"] = new_tg
+            cfg["telegram_chat_id"] = form.get("telegram_chat_id", "").strip()
+            cfg["offline_alert_minutes"] = max(0.0, float(form.get("offline_alert_minutes", 10) or 0))
+            cfg["cheap_hours_enabled"] = bool(form.get("cheap_hours_enabled"))
+            cfg["cheap_hours_count"] = min(12, max(1, int(form.get("cheap_hours_count", 3) or 3)))
+            hh_mm = form.get("cheap_hours_time", "20:45").strip()
+            if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", hh_mm):
+                raise ValueError("La hora del aviso de horas baratas debe tener el formato HH:MM.")
+            cfg["cheap_hours_time"] = hh_mm
+            password, repeat = form.get("new_password", ""), form.get("new_password_repeat", "")
+            if password or repeat:
+                if password != repeat:
+                    raise ValueError("Las dos contraseñas no coinciden.")
+                if len(password) < 6:
+                    raise ValueError("La contraseña debe tener al menos 6 caracteres.")
+                cfg["admin_password_hash"] = generate_password_hash(password)
+                session["admin"] = True
+            elif form.get("remove_password"):
+                cfg["admin_password_hash"] = ""
+            save_config(cfg)
+            reload_zones()
+            start_pollers()
+        except (ValueError, TypeError) as e:
+            flash(f"No se han guardado los ajustes: {e}")
+            return redirect(url_for("ajustes"))
+        try:
+            n = fetch_pvpc()
+            flash(f"Ajustes guardados. Precios horarios cargados: {n}.")
+        except Exception as e:
+            flash(f"Ajustes guardados, pero no se pudieron descargar precios PVPC: {e}")
+        return redirect(url_for("ajustes"))
+    return render_template("ajustes.html", cfg=cfg, zones=cfg["zones"], models=MODELS, default_zone=DEFAULT_ZONE,
+                           zone_errors=ZONE_ERRORS)
+
+@app.route("/ajustes/probar-telegram", methods=["POST"])
+@admin_required
+def probar_telegram():
+    try:
+        if notify("✅ Prueba de avisos del monitor de consumo eléctrico."):
+            flash("Mensaje de prueba enviado por Telegram.")
+        else:
+            flash("Configura y guarda el token del bot y el chat ID antes de probar.")
+    except Exception as e:
+        flash(f"No se pudo enviar el mensaje de prueba: {e}")
+    return redirect(url_for("ajustes") + "#avisos")
+
+# ---------------------------------------------------------------- arranque
+
+def setup_logging():
+    # Con pythonw (arranque automático) no hay consola: todo va a app.log.
+    if sys.stdout is None or sys.stderr is None:
+        stream = open(LOG_PATH.with_suffix(".console.log"), "a", encoding="utf-8", buffering=1)
+        sys.stdout = sys.stdout or stream
+        sys.stderr = sys.stderr or stream
+    handlers = [RotatingFileHandler(LOG_PATH, maxBytes=2_000_000, backupCount=3, encoding="utf-8"),
+                logging.StreamHandler()]
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", handlers=handlers)
+
+def setup_app():
+    cfg = load_config()
+    if not cfg.get("secret_key"):
+        cfg["secret_key"] = secrets.token_hex(32)
+        save_config(cfg)
+    app.secret_key = cfg["secret_key"]
+    app.permanent_session_lifetime = timedelta(days=30)
+    reload_zones()
+    init_db(DEFAULT_ZONE)
     for zone in ZONES:
-        if zone != DEFAULT_ZONE:
-            init_db_for_zone(zone)
-        threading.Thread(target=poller, args=(zone,), daemon=True).start()
-    threading.Thread(target=price_refresh_loop,daemon=True).start()
-    print(f"Web local: http://127.0.0.1:{PORT}")
-    print(f"Web en la red: http://<IP-DE-ESTE-ORDENADOR>:{PORT}")
-    print("Zonas: " + ", ".join(f"{z}={d['ip']} ({d['name']})" for z,d in ZONES.items()))
-    app.run(host="0.0.0.0",port=PORT,debug=False)
+        init_db(zone)
+
+if __name__ == "__main__":
+    setup_logging()
+    setup_app()
+    start_pollers()
+    for target in (price_refresh_loop, maintenance_loop, alert_loop):
+        threading.Thread(target=target, daemon=True, name=target.__name__).start()
+    log.info("Web local: http://127.0.0.1:%d", PORT)
+    log.info("Web en la red: http://<IP-DE-ESTE-ORDENADOR>:%d", PORT)
+    log.info("Zonas: %s", ", ".join(f"{z}={zone_connection(d)} ({d['name']})" for z, d in ZONES.items()))
+    app.run(host="0.0.0.0", port=PORT, debug=False)

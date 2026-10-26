@@ -1,0 +1,70 @@
+<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Consumo eléctrico · PVPC</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='estilo.css') }}">
+<script src="{{ url_for('static', filename='chart.umd.min.js') }}"></script>
+</head><body><main>
+<header><div><h1 id="pageTitle">Consumo eléctrico</h1><p>Lecturas de los medidores + PVPC horario + estimación de factura</p>
+<div class="row"><label for="zoneSelect" style="flex-direction:row;align-items:center">Zona:</label><select id="zoneSelect" onchange="changeZone()">{% for key, z in zones.items() %}<option value="{{ key }}">{{ z.name or key }}{% if not z.enabled %} (desactivada){% endif %}</option>{% endfor %}</select><span class="small" id="deviceIp"></span></div></div>
+<div class="status" id="status">Cargando…</div></header>
+<nav><a id="historyLink" href="/historico">Consultar histórico</a><a id="exportLink" href="/exportar.csv">Descargar CSV de esta zona</a><a href="/ajustes">Ajustes</a>{% if is_admin and has_password %}<a href="/salir">Cerrar sesión</a>{% endif %}</nav>
+{% if not has_password %}<div class="banner">Los ajustes no tienen contraseña: cualquiera en tu red puede cambiarlos. <a href="/ajustes#seguridad">Poner una contraseña</a></div>{% endif %}
+<div class="alerts" id="alerts"></div>
+<section class="grid">
+<div class="card"><div class="label">Potencia actual</div><div class="value" id="power">— W</div><div class="small" id="updated"></div></div>
+<div class="card"><div class="label">Contador real consumido</div><div class="value" id="total">— kWh</div><div class="small">Contador interno del medidor</div></div>
+<div class="card"><div class="label">PVPC hora actual</div><div class="value" id="price">— €/kWh</div><div class="small">Indicador PVPC de REE/ESIOS, antes de impuestos</div></div>
+<div class="card"><div class="label">Consumo de hoy</div><div class="value" id="today">— kWh</div><div class="small">Registrado por esta aplicación</div></div>
+<div class="card"><div class="label">Coste energía hoy</div><div class="value" id="todaycost">— €</div><div class="small">Solo energía registrada y con precio disponible</div></div>
+<div class="card"><div class="label">Consumo mes actual</div><div class="value" id="monthkwh">— kWh</div></div>
+<div class="card"><div class="label">Coste energía mes</div><div class="value" id="monthenergy">— €</div><div class="small">Sin impuestos ni término fijo</div></div>
+<div class="card"><div class="label">Factura estimada del mes</div><div class="value" id="bill">— €</div><div class="small" id="billnote">Incluye término fijo e impuestos configurados</div></div>
+<div class="card"><div class="label">Energía devuelta total</div><div class="value" id="returned">— kWh</div></div>
+<div class="card full"><h2>Potencia actual y precio PVPC</h2><div class="chart"><canvas id="powerPvpcChart"></canvas></div><p class="small">Potencia en W y PVPC en €/kWh, con escalas independientes. Últimas lecturas guardadas.</p></div>
+<div class="card"><h2>Consumo por día</h2><div class="chart"><canvas id="dailyChart"></canvas></div><p class="small">Consumo diario en kWh de los últimos 14 días.</p></div>
+<div class="card wide"><h2>Consumo por hora · hoy</h2><div class="chart"><canvas id="hourlyChart"></canvas></div><p class="small">Suma del consumo registrado en cada hora del día actual.</p></div>
+<div class="card full"><h2>Coste estimado acumulado del mes</h2><div class="chart"><canvas id="costChart"></canvas></div><p class="small">Coste de la energía acumulado hora a hora. Las horas sin precio se completan en cuanto se descarga el PVPC de ese día.</p></div>
+<div class="card full"><h2>Desglose estimado de factura</h2><div style="overflow:auto"><table><tbody id="billrows"></tbody></table></div></div>
+<div class="card full"><h2>Últimas lecturas</h2><div style="overflow:auto"><table><thead><tr><th>Fecha/hora</th><th>W</th><th>Contador kWh</th><th>Delta kWh</th><th>Precio €/MWh</th><th>Coste energía €</th></tr></thead><tbody id="rows"></tbody></table></div></div>
+</section><p class="small">Fuente de precios: <a href="https://www.esios.ree.es/" target="_blank" rel="noreferrer">Red Eléctrica de España · ESIOS</a>. El indicador PVPC incluye energía, peajes y cargos, pero no impuestos. La factura completa es aproximada y depende de los datos configurados y de que el histórico esté completo.</p>
+</main>
+<script>
+const $=id=>document.getElementById(id);
+const f=(v,n=3)=>v==null?'—':Number(v).toLocaleString('es-ES',{minimumFractionDigits:0,maximumFractionDigits:n});
+const eur=v=>v==null?'—':f(v,2)+' €';
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+let currentZone=(()=>{try{return localStorage.getItem('zona')}catch(e){return null}})()||'{{ default_zone }}';
+if(![...$('zoneSelect').options].some(o=>o.value===currentZone))currentZone='{{ default_zone }}';
+$('zoneSelect').value=currentZone;
+function changeZone(){currentZone=$('zoneSelect').value;try{localStorage.setItem('zona',currentZone)}catch(e){}
+ const q='?zona='+encodeURIComponent(currentZone);$('exportLink').href='/exportar.csv'+q;$('historyLink').href='/historico'+q;
+ $('pageTitle').textContent='Consumo eléctrico · '+$('zoneSelect').selectedOptions[0].textContent;update();}
+const chartOptions={responsive:true,maintainAspectRatio:false,animation:false,interaction:{mode:'index',intersect:false},plugins:{legend:{labels:{color:'#edf4ff'}}},scales:{x:{ticks:{color:'#9aabc4',maxTicksLimit:10},grid:{color:'#25334b'}},y:{beginAtZero:true,ticks:{color:'#9aabc4'},grid:{color:'#25334b'}}}};
+const powerPvpcChart=new Chart($('powerPvpcChart'),{type:'line',data:{labels:[],datasets:[
+{label:'Potencia (W)',data:[],yAxisID:'yPower',borderColor:'#54d6a0',backgroundColor:'#54d6a022',fill:false,tension:.2,pointRadius:0},
+{label:'PVPC (€/kWh)',data:[],yAxisID:'yPrice',borderColor:'#ffd479',backgroundColor:'#ffd47922',fill:false,tension:.2,pointRadius:0}
+]},options:{...chartOptions,scales:{x:chartOptions.scales.x,yPower:{type:'linear',position:'left',beginAtZero:true,title:{display:true,text:'Potencia (W)',color:'#54d6a0'},ticks:{color:'#9aabc4'},grid:{color:'#25334b'}},yPrice:{type:'linear',position:'right',beginAtZero:true,title:{display:true,text:'PVPC (€/kWh)',color:'#ffd479'},ticks:{color:'#9aabc4'},grid:{drawOnChartArea:false}}}}});
+const dailyChart=new Chart($('dailyChart'),{type:'bar',data:{labels:[],datasets:[{label:'Consumo (kWh)',data:[],backgroundColor:'#54d6a0'}]},options:chartOptions});
+const hourlyChart=new Chart($('hourlyChart'),{type:'bar',data:{labels:[],datasets:[{label:'Consumo (kWh)',data:[],backgroundColor:'#6da9ff'}]},options:chartOptions});
+const costChart=new Chart($('costChart'),{type:'line',data:{labels:[],datasets:[{label:'Coste de energía acumulado (€)',data:[],borderColor:'#54d6a0',backgroundColor:'#54d6a022',fill:true,tension:.2,pointRadius:0}]},options:chartOptions});
+async function update(){try{const j=await(await fetch('/api/estado?zona='+encodeURIComponent(currentZone))).json();
+ $('deviceIp').textContent='Conexión: '+j.ip;
+ $('status').textContent=j.error?'Error · '+j.error:(j.ok?'Conectado · '+j.ip:'Sin lectura todavía · '+j.ip);
+ if(j.price_count===0)$('status').textContent+=' · Esperando precios PVPC';
+ let d=j.latest||{};$('power').textContent=f(d.act_power,1)+' W';$('total').textContent=f(j.total_kwh,3)+' kWh';$('returned').textContent=f(j.returned_kwh,3)+' kWh';
+ $('price').textContent=j.price_now==null?'Sin precio':f(j.price_now/1000,5)+' €/kWh';$('updated').textContent=d.timestamp?'Actualizado '+d.timestamp:'';
+ $('today').textContent=f(j.today_kwh,3)+' kWh';$('todaycost').textContent=eur(j.today_energy_eur);$('monthkwh').textContent=f(j.month_kwh,3)+' kWh';$('monthenergy').textContent=eur(j.month_energy_eur);$('bill').textContent=eur(j.month_total_estimate);
+ $('billnote').textContent=j.fixed_costs?'Incluye término fijo e impuestos configurados':('Solo energía e impuestos: el término fijo se cuenta en '+(j.fixed_costs_zone||'la zona que lo paga'));
+ const rows=[['Energía PVPC registrada',j.month_energy_eur]];
+ if(j.fixed_costs)rows.push(['Término potencia (estimado)',j.power_cost],['Otros costes fijos',j.other_fixed]);
+ rows.push(['Descuento configurado',j.discount?-j.discount:0],['Base del impuesto eléctrico',j.taxable_base],['Impuesto electricidad',j.electricity_tax]);
+ if(j.fixed_costs)rows.push(['Alquiler contador',j.meter_cost]);
+ rows.push(['IVA',j.vat],['TOTAL ESTIMADO',j.month_total_estimate]);
+ $('billrows').innerHTML=rows.map(r=>'<tr><td>'+r[0]+'</td><td>'+eur(r[1])+'</td></tr>').join('');
+ $('rows').innerHTML=j.recent.slice().reverse().map(x=>'<tr>'+[x.timestamp,f(x.act_power,1),f(x.total_kwh,3),f(x.delta_kwh,5),f(x.pvpc_eur_mwh,2),f(x.energy_cost_eur,6)+' €'].map(v=>'<td>'+v+'</td>').join('')+'</tr>').join('');
+ $('alerts').innerHTML=j.alerts.map(a=>'<div class="alert'+(a.kind==='horas_baratas'?' info':'')+(a.active||a.kind==='horas_baratas'?'':' done')+'"><span class="when">'+esc(a.time)+'</span>'+esc(a.message)+(a.active||a.kind==='horas_baratas'?'':' · resuelto')+'</div>').join('');
+ powerPvpcChart.data.labels=j.power_pvpc_history.map(x=>x.time);powerPvpcChart.data.datasets[0].data=j.power_pvpc_history.map(x=>x.power);powerPvpcChart.data.datasets[1].data=j.power_pvpc_history.map(x=>x.price==null?null:x.price/1000);powerPvpcChart.update();
+ dailyChart.data.labels=j.daily_consumption.map(x=>x.day.slice(5));dailyChart.data.datasets[0].data=j.daily_consumption.map(x=>x.kwh);dailyChart.update();
+ hourlyChart.data.labels=j.hourly_consumption.map(x=>x.hour);hourlyChart.data.datasets[0].data=j.hourly_consumption.map(x=>x.kwh);hourlyChart.update();
+ costChart.data.labels=j.cost_history.map(x=>x.time);costChart.data.datasets[0].data=j.cost_history.map(x=>x.cost);costChart.update();
+}catch(e){$('status').textContent='Error de conexión web';}}
+changeZone();setInterval(update,5000);
+</script></body></html>
