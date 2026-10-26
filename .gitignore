@@ -10,3 +10,8 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+
+# Registro de la aplicación y ficheros temporales
+app.log*
+app.console.log
+config.json.tmp

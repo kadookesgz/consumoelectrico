@@ -1,0 +1,8 @@
+<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Entrar</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='estilo.css') }}">
+</head><body><main style="max-width:420px">
+<section class="card" style="margin-top:40px"><h1 style="font-size:24px">Ajustes protegidos</h1>
+{% with messages = get_flashed_messages() %}{% if messages %}<p class="warn">{{ messages[0] }}</p>{% endif %}{% endwith %}
+<form method="post"><div class="row" style="flex-direction:column;align-items:stretch"><label>Contraseña<input name="password" type="password" autofocus autocomplete="current-password"></label><button type="submit">Entrar</button></div></form>
+<p class="small"><a href="/">← Volver al monitor</a></p></section>
+</main></body></html>

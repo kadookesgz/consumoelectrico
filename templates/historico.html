@@ -1,0 +1,82 @@
+<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Histórico de consumo</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='estilo.css') }}">
+<script src="{{ url_for('static', filename='chart.umd.min.js') }}"></script>
+</head><body><main>
+<header style="display:block;margin-bottom:16px"><h1>Histórico de consumo</h1><p><a href="/">← Volver al monitor</a> · <span id="available">Cargando…</span></p></header>
+<section class="card" style="margin-bottom:14px"><div class="row">
+<label>Zona<select id="zona">{% for key, z in zones.items() %}<option value="{{ key }}">{{ z.name or key }}</option>{% endfor %}</select></label>
+<label>Desde<input type="date" id="desde"></label><label>Hasta<input type="date" id="hasta"></label>
+<label>Agrupar por<select id="agrupar"><option value="auto">Automático</option><option value="hora">Hora</option><option value="dia">Día</option><option value="mes">Mes</option></select></label>
+<button onclick="load()">Consultar</button></div>
+<div class="row" style="margin-top:10px"><button class="alt" onclick="preset('hoy')">Hoy</button><button class="alt" onclick="preset('ayer')">Ayer</button><button class="alt" onclick="preset('7d')">Últimos 7 días</button><button class="alt" onclick="preset('30d')">Últimos 30 días</button><button class="alt" onclick="preset('mes')">Este mes</button><button class="alt" onclick="preset('mesant')">Mes anterior</button><button class="alt" onclick="preset('todo')">Todo</button></div></section>
+<section class="grid">
+<div class="card"><div class="label">Consumo del periodo</div><div class="value" id="kwh">—</div><div class="small" id="kwhPrev"></div></div>
+<div class="card"><div class="label">Coste de energía</div><div class="value" id="cost">—</div><div class="small" id="costPrev"></div></div>
+<div class="card"><div class="label">Precio medio pagado</div><div class="value" id="avgprice">—</div><div class="small" id="pricePrev"></div></div>
+<div class="card"><div class="label">Potencia máxima</div><div class="value" id="maxpower">—</div><div class="small" id="maxpowerat"></div></div>
+<div class="card"><div class="label">Potencia media</div><div class="value" id="avgpower">—</div><div class="small" id="avgpowerPrev"></div></div>
+<div class="card"><div class="label">Lecturas guardadas</div><div class="value" id="readings">—</div><div class="small" id="coverage"></div></div>
+<p class="small full" id="prevNote" style="margin:0"></p>
+<div class="card full"><h2>Consumo y precio PVPC</h2><div class="chart"><canvas id="energyChart"></canvas></div></div>
+<div class="card full"><h2>Coste de energía</h2><div class="chart"><canvas id="costChart"></canvas></div></div>
+<div class="card full"><h2>Potencia</h2><div class="chart"><canvas id="powerChart"></canvas></div><p class="small" id="powerNote"></p></div>
+<div class="card full"><h2>Reparto entre zonas</h2><p class="small">Consumo de cada medidor en el mismo periodo. Si un medidor está dentro de otro (se indica en Ajustes → Equipos), aparece también el resto no medido aparte.</p>
+<div class="chart" style="height:220px"><canvas id="zonesChart"></canvas></div>
+<div style="overflow:auto"><table><thead><tr><th>Zona</th><th>Consumo kWh</th><th>Coste €</th><th>% del total</th></tr></thead><tbody id="zonesRows"></tbody></table></div></div>
+<div class="card full"><h2>Detalle</h2><p><a id="csvAgg" href="#">Descargar este detalle en CSV</a> · <a id="csvRaw" href="#">Descargar lecturas originales del periodo</a></p><div style="overflow:auto;max-height:520px"><table><thead><tr><th>Periodo</th><th>Consumo kWh</th><th>Coste €</th><th>Precio medio €/kWh</th><th>Potencia media W</th><th>Potencia máx. W</th><th>Lecturas</th></tr></thead><tbody id="rows"></tbody></table></div></div>
+<div class="card full"><h2>Huecos sin datos</h2><p class="small">Periodos de más de 5 minutos sin lecturas (la aplicación estaba parada o el medidor no respondía). El consumo de cada hueco se reparte entre sus horas de forma proporcional al tiempo.</p><p class="small warn" id="gapsNote"></p><div style="overflow:auto"><table><thead><tr><th>Desde</th><th>Hasta</th><th>Duración</th><th>Consumo repartido kWh</th></tr></thead><tbody id="gaps"></tbody></table></div></div>
+</section></main>
+<script>
+const $=id=>document.getElementById(id);
+const f=(v,n=3)=>v==null?'—':Number(v).toLocaleString('es-ES',{minimumFractionDigits:0,maximumFractionDigits:n});
+const eur=v=>v==null?'—':f(v,2)+' €';
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const iso=d=>d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
+const dur=s=>{s=Math.round(s);const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return (d?d+' d ':'')+(h?h+' h ':'')+m+' min';};
+const vsPrev=(now,prev)=>{if(now==null||prev==null||!prev)return '';const p=(now-prev)/prev*100;return '<span class="'+(p>0?'delta-up':'delta-down')+'">'+(p>0?'+':'')+f(p,1)+' %</span> vs periodo anterior';};
+let info=null;
+function preset(p){const t=new Date();let a=new Date(t),b=new Date(t);
+ if(p==='ayer'){a.setDate(t.getDate()-1);b=new Date(a);}
+ else if(p==='7d')a.setDate(t.getDate()-6);
+ else if(p==='30d')a.setDate(t.getDate()-29);
+ else if(p==='mes')a=new Date(t.getFullYear(),t.getMonth(),1);
+ else if(p==='mesant'){a=new Date(t.getFullYear(),t.getMonth()-1,1);b=new Date(t.getFullYear(),t.getMonth(),0);}
+ else if(p==='todo'&&info&&info.first){a=new Date(info.first.slice(0,10)+'T00:00');b=new Date(info.last.slice(0,10)+'T00:00');}
+ $('desde').value=iso(a);$('hasta').value=iso(b);load();}
+const opts={responsive:true,maintainAspectRatio:false,animation:false,interaction:{mode:'index',intersect:false},plugins:{legend:{labels:{color:'#edf4ff'}}},scales:{x:{ticks:{color:'#9aabc4',maxTicksLimit:14},grid:{color:'#25334b'}},y:{beginAtZero:true,ticks:{color:'#9aabc4'},grid:{color:'#25334b'}}}};
+const energyChart=new Chart($('energyChart'),{data:{labels:[],datasets:[
+ {type:'bar',label:'Consumo (kWh)',data:[],yAxisID:'y',backgroundColor:'#54d6a0'},
+ {type:'line',label:'PVPC medio (€/kWh)',data:[],yAxisID:'yPrice',borderColor:'#ffd479',backgroundColor:'#ffd479',pointRadius:0,tension:.2,spanGaps:true}]},
+ options:{...opts,scales:{x:opts.scales.x,y:{...opts.scales.y,title:{display:true,text:'kWh',color:'#54d6a0'}},yPrice:{position:'right',beginAtZero:true,title:{display:true,text:'€/kWh',color:'#ffd479'},ticks:{color:'#9aabc4'},grid:{drawOnChartArea:false}}}}});
+const costChart=new Chart($('costChart'),{type:'bar',data:{labels:[],datasets:[{label:'Coste (€)',data:[],backgroundColor:'#6da9ff'}]},options:opts});
+const powerChart=new Chart($('powerChart'),{type:'line',data:{labels:[],datasets:[
+ {label:'Potencia media (W)',data:[],borderColor:'#54d6a0',backgroundColor:'#54d6a022',fill:true,pointRadius:0,tension:.2},
+ {label:'Potencia máxima (W)',data:[],borderColor:'#ff8a8a',pointRadius:0,tension:.2,borderWidth:1}]},options:opts});
+const zonesChart=new Chart($('zonesChart'),{type:'bar',data:{labels:[],datasets:[{label:'Consumo (kWh)',data:[],backgroundColor:[]}]},
+ options:{...opts,indexAxis:'y',plugins:{legend:{display:false}},scales:{x:{beginAtZero:true,ticks:{color:'#9aabc4'},grid:{color:'#25334b'}},y:{ticks:{color:'#edf4ff'},grid:{display:false}}}}});
+async function loadInfo(){const r=await fetch('/api/historico/rango?zona='+encodeURIComponent($('zona').value));info=await r.json();
+ $('available').textContent=info.first?('Datos de esta zona desde '+info.first+' hasta '+info.last+' · '+f(info.count,0)+' lecturas'):'Esta zona todavía no tiene lecturas guardadas';}
+async function load(){const q=new URLSearchParams({zona:$('zona').value,desde:$('desde').value,hasta:$('hasta').value,agrupar:$('agrupar').value});
+ history.replaceState(null,'','/historico?'+q);
+ $('csvAgg').href='/exportar.csv?'+q;const raw=new URLSearchParams(q);raw.delete('agrupar');$('csvRaw').href='/exportar.csv?'+raw;
+ const r=await fetch('/api/historico?'+q);const j=await r.json();if(!r.ok){$('available').innerHTML='<span class="warn">'+esc(j.error||'Error')+'</span>';return;}
+ const t=j.totals,pv=j.previous;$('kwh').textContent=f(t.kwh,3)+' kWh';$('cost').textContent=eur(t.cost_eur);$('avgprice').textContent=t.avg_price_eur_kwh==null?'—':f(t.avg_price_eur_kwh,5)+' €/kWh';
+ $('kwhPrev').innerHTML=vsPrev(t.kwh,pv.kwh);$('costPrev').innerHTML=vsPrev(t.cost_eur,pv.cost_eur)||'PVPC sin impuestos ni término fijo';$('pricePrev').innerHTML=vsPrev(t.avg_price_eur_kwh,pv.avg_price_eur_kwh)||'Coste / consumo con precio disponible';$('avgpowerPrev').innerHTML=vsPrev(t.avg_power,pv.avg_power);
+ $('prevNote').textContent=pv.readings?('Periodo anterior comparado: '+pv.from+' a '+pv.to+' · '+f(pv.kwh,3)+' kWh · '+eur(pv.cost_eur)):'No hay datos del periodo anterior para comparar.';
+ $('maxpower').textContent=t.max_power==null?'—':f(t.max_power,1)+' W';$('maxpowerat').textContent=t.max_power_at?'el '+t.max_power_at:'';$('avgpower').textContent=t.avg_power==null?'—':f(t.avg_power,1)+' W';
+ $('readings').textContent=f(t.readings,0);$('coverage').textContent=t.readings?(j.gaps.length?j.gaps.length+' huecos sin datos':'Sin huecos'):'Sin lecturas en este periodo';
+ const lab=j.groups.map(g=>g.label);energyChart.data.labels=lab;energyChart.data.datasets[0].data=j.groups.map(g=>g.kwh);energyChart.data.datasets[1].data=j.groups.map(g=>g.avg_price_eur_kwh);energyChart.update();
+ costChart.data.labels=lab;costChart.data.datasets[0].data=j.groups.map(g=>g.cost_eur);costChart.update();
+ powerChart.data.labels=j.power.map(p=>p.time);powerChart.data.datasets[0].data=j.power.map(p=>p.avg);powerChart.data.datasets[1].data=j.power.map(p=>p.max);powerChart.update();
+ $('powerNote').textContent='Cada punto resume '+dur(j.power_bucket_seconds)+' de lecturas.';
+ const top=j.zones.filter(z=>!z.parent).reduce((s,z)=>s+z.kwh,0);
+ zonesChart.data.labels=j.zones.map(z=>(z.parent?'  ↳ ':'')+z.name);zonesChart.data.datasets[0].data=j.zones.map(z=>z.kwh);
+ zonesChart.data.datasets[0].backgroundColor=j.zones.map(z=>z.zone===j.zone?'#54d6a0':(z.rest?'#3b4d69':'#6da9ff'));zonesChart.update();
+ $('zonesRows').innerHTML=j.zones.map(z=>'<tr><td>'+(z.parent?'&nbsp;&nbsp;↳ ':'')+esc(z.name)+'</td><td>'+f(z.kwh,3)+'</td><td>'+eur(z.cost_eur)+'</td><td>'+(top?f(z.kwh/top*100,1)+' %':'—')+'</td></tr>').join('');
+ $('rows').innerHTML=j.groups.map(g=>'<tr>'+[g.label,f(g.kwh,3),eur(g.cost_eur),g.avg_price_eur_kwh==null?'—':f(g.avg_price_eur_kwh,5),f(g.avg_power,1),f(g.max_power,1),f(g.readings,0)].map(v=>'<td>'+v+'</td>').join('')+'</tr>').join('')||'<tr><td colspan="7">Sin datos</td></tr>';
+ $('gapsNote').textContent=j.gaps_complete?'':'Las lecturas de 5 s de parte de este periodo ya se han borrado (Ajustes → Histórico), así que puede haber huecos que no se muestran.';
+ $('gaps').innerHTML=j.gaps.map(g=>'<tr><td>'+g.from+'</td><td>'+g.to+'</td><td>'+dur(g.seconds)+'</td><td>'+f(g.kwh_after,3)+'</td></tr>').join('')||'<tr><td colspan="4">Sin huecos en este periodo</td></tr>';}
+$('zona').onchange=async()=>{await loadInfo();load();};
+(async()=>{const p=new URLSearchParams(location.search);if(p.get('zona'))$('zona').value=p.get('zona');if(p.get('agrupar'))$('agrupar').value=p.get('agrupar');
+ await loadInfo();if(p.get('desde')&&p.get('hasta')){$('desde').value=p.get('desde');$('hasta').value=p.get('hasta');load();}else preset('7d');})();
+</script></body></html>
