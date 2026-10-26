@@ -61,3 +61,14 @@ INTEGRACIÓN SCHNEIDER POWERLOGIC PM710:
 - Instala la dependencia nueva con el entorno de Python de esta aplicación: pip install -r requirements.txt.
 - Requisito de red: el ordenador que ejecuta esta aplicación debe poder alcanzar 192.168.100.206:502. Si está en otra subred, comprueba las rutas/VLAN y que el conversor acepte conexiones Modbus TCP.
 - La decodificación usa el formato IEEE-754 de 32 bits con orden de registros alto-bajo. Antes de confiar en las cifras, compara tensión, potencia, corriente y energía con la pantalla/lectura del contador; si aparecen valores absurdos, puede variar el orden de palabras o el mapa configurado en el conversor.
+
+
+CONSULTA DEL HISTÓRICO:
+- En el monitor, pulsa “Consultar histórico” (o abre http://127.0.0.1:5000/historico).
+- Elige zona y fechas, o usa los atajos: Hoy, Ayer, Últimos 7 días, Últimos 30 días, Este mes, Mes anterior, Todo.
+- “Agrupar por” en Automático usa horas hasta 3 días, días hasta 3 meses y meses para periodos más largos.
+- Muestra consumo, coste de energía, precio medio pagado, potencia media y máxima, gráficas y una tabla por periodo.
+- “Huecos sin datos” lista los intervalos de más de 5 minutos sin lecturas (aplicación parada o medidor sin respuesta).
+- Se puede descargar en CSV tanto el detalle agrupado como las lecturas originales del periodo.
+- La dirección de la página guarda la consulta, así que puedes guardarla en favoritos o compartirla dentro de la red.
+- Solo lee las bases de datos existentes: no modifica ni borra el histórico.

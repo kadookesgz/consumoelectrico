@@ -349,13 +349,13 @@ PAGE = r"""<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name
 <div class="card"><h2>Consumo por hora · hoy</h2><div class="chart"><canvas id="hourlyChart"></canvas></div><p class="small">Suma del consumo registrado en cada hora del día actual.</p></div>
 <div class="card full"><h2>Coste estimado acumulado del mes</h2><div class="chart"><canvas id="costChart"></canvas></div><p class="small">El coste horario se acumula cuando la aplicación está funcionando y el precio horario está disponible.</p></div>
 <div class="card full"><h2>Desglose estimado de factura</h2><div style="overflow:auto"><table><tbody id="billrows"></tbody></table></div></div>
-<div class="card full"><h2>Últimas lecturas</h2><p><a id="exportLink" href="/exportar.csv?zona=principal">Descargar CSV de esta zona</a> · <a href="/ajustes">Configurar tarifa y token PVPC</a></p><div style="overflow:auto"><table><thead><tr><th>Fecha/hora</th><th>W</th><th>Contador kWh</th><th>Delta kWh</th><th>Precio €/MWh</th><th>Coste energía €</th></tr></thead><tbody id="rows"></tbody></table></div></div>
+<div class="card full"><h2>Últimas lecturas</h2><p><a id="exportLink" href="/exportar.csv?zona=principal">Descargar CSV de esta zona</a> · <a id="historyLink" href="/historico?zona=principal">Consultar histórico</a> · <a href="/ajustes">Configurar tarifa y token PVPC</a></p><div style="overflow:auto"><table><thead><tr><th>Fecha/hora</th><th>W</th><th>Contador kWh</th><th>Delta kWh</th><th>Precio €/MWh</th><th>Coste energía €</th></tr></thead><tbody id="rows"></tbody></table></div></div>
 </section><p class="small">Fuente de precios: <a href="https://www.esios.ree.es/" target="_blank" rel="noreferrer">Red Eléctrica de España · ESIOS</a>. El indicador PVPC incluye energía, peajes y cargos, pero no impuestos. La factura completa es aproximada y depende de los datos configurados y de que el histórico esté completo.</p>
 </main>
 <script>
 const f=(v,n=3)=>v==null?'—':Number(v).toLocaleString('es-ES',{minimumFractionDigits:0,maximumFractionDigits:n});
 const eur=v=>v==null?'—':f(v,2)+' €';
-let currentZone='principal';function changeZone(){currentZone=document.getElementById('zoneSelect').value;document.getElementById('pageTitle').textContent=currentZone==='acuario'?'Consumo eléctrico · Acuario':(currentZone==='schneider'?'Consumo eléctrico · Schneider PM710':'Consumo eléctrico · Zona principal');document.getElementById('deviceIp').textContent='Conexión: '+(currentZone==='acuario'?'192.168.4.203':(currentZone==='schneider'?'192.168.100.206:502 · Modbus TCP · Slave ID 1':'192.168.4.175'));document.getElementById('exportLink').href='/exportar.csv?zona='+encodeURIComponent(currentZone);update();}
+let currentZone='principal';function changeZone(){currentZone=document.getElementById('zoneSelect').value;document.getElementById('pageTitle').textContent=currentZone==='acuario'?'Consumo eléctrico · Acuario':(currentZone==='schneider'?'Consumo eléctrico · Schneider PM710':'Consumo eléctrico · Zona principal');document.getElementById('deviceIp').textContent='Conexión: '+(currentZone==='acuario'?'192.168.4.203':(currentZone==='schneider'?'192.168.100.206:502 · Modbus TCP · Slave ID 1':'192.168.4.175'));document.getElementById('exportLink').href='/exportar.csv?zona='+encodeURIComponent(currentZone);document.getElementById('historyLink').href='/historico?zona='+encodeURIComponent(currentZone);update();}
 const chartOptions={responsive:true,maintainAspectRatio:false,animation:false,interaction:{mode:'index',intersect:false},plugins:{legend:{labels:{color:'#edf4ff'}}},scales:{x:{ticks:{color:'#9aabc4',maxTicksLimit:10},grid:{color:'#25334b'}},y:{beginAtZero:true,ticks:{color:'#9aabc4'},grid:{color:'#25334b'}}}};
 const powerPvpcChart=new Chart(document.getElementById('powerPvpcChart'),{type:'line',data:{labels:[],datasets:[
 {label:'Potencia (W)',data:[],yAxisID:'yPower',borderColor:'#54d6a0',backgroundColor:'#54d6a022',fill:false,tension:.2,pointRadius:0},
@@ -387,6 +387,156 @@ body{margin:0;background:#0b1220;color:#edf4ff;font:15px system-ui,Arial}.wrap{m
 <div><label>IVA (%)</label><input name="vat_pct" type="number" step="0.01" value="{{ cfg.vat_pct }}"></div>
 <div><label>Descuento sobre energía (%)</label><input name="extra_discount_pct" type="number" step="0.01" value="{{ cfg.extra_discount_pct }}"></div>
 </div><p class="hint">Los precios de potencia, alquiler e impuestos son editables: comprueba tu factura y ajusta los valores a los que te aplique tu comercializadora. El término de energía PVPC del indicador 1001 incluye peajes/cargos y coste de energía, pero excluye impuestos.</p><button type="submit">Guardar ajustes y actualizar precios</button></form><p><a href="/">← Volver al monitor</a></p></div></div></body></html>"""
+
+HISTORY = r"""<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Histórico de consumo</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script><style>
+*{box-sizing:border-box}body{margin:0;background:#0b1220;color:#edf4ff;font:15px system-ui,Arial}main{max-width:1200px;margin:auto;padding:22px}header{margin-bottom:16px}h1{margin:0 0 6px;font-size:clamp(24px,4vw,34px)}h2{font-size:18px;margin-top:0}p,.muted{color:#9aabc4}.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.card{background:#121d30;border:1px solid #25334b;border-radius:16px;padding:18px}.label{color:#9aabc4;font-size:13px}.value{font-size:clamp(22px,3vw,30px);font-weight:700;margin-top:8px}.small{font-size:12px;color:#9aabc4;margin-top:8px}.full{grid-column:1/-1}.chart{height:300px}table{width:100%;border-collapse:collapse}td,th{text-align:left;padding:7px 8px;border-bottom:1px solid #25334b;white-space:nowrap}th{color:#9aabc4}a{color:#54d6a0}button{background:#23644f;border:0;color:white;border-radius:9px;padding:9px 13px;cursor:pointer}button.alt{background:#1d2a40;border:1px solid #344761}select,input{padding:9px;border-radius:8px;background:#0b1220;color:#edf4ff;border:1px solid #344761}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:end}.row label{display:flex;flex-direction:column;gap:4px;font-size:13px;color:#9aabc4}.warn{color:#ffd479}
+@media(max-width:760px){main{padding:12px}.grid{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:430px){.grid{grid-template-columns:minmax(0,1fr)}.full{grid-column:auto}}.card{min-width:0}
+</style></head><body><main>
+<header><h1>Histórico de consumo</h1><p><a href="/">← Volver al monitor</a> · <span id="available">Cargando…</span></p></header>
+<section class="card" style="margin-bottom:14px"><div class="row">
+<label>Zona<select id="zona">{% for key, z in zones.items() %}<option value="{{ key }}">{{ z.name }}</option>{% endfor %}</select></label>
+<label>Desde<input type="date" id="desde"></label><label>Hasta<input type="date" id="hasta"></label>
+<label>Agrupar por<select id="agrupar"><option value="auto">Automático</option><option value="hora">Hora</option><option value="dia">Día</option><option value="mes">Mes</option></select></label>
+<button onclick="load()">Consultar</button></div>
+<div class="row" style="margin-top:10px"><button class="alt" onclick="preset('hoy')">Hoy</button><button class="alt" onclick="preset('ayer')">Ayer</button><button class="alt" onclick="preset('7d')">Últimos 7 días</button><button class="alt" onclick="preset('30d')">Últimos 30 días</button><button class="alt" onclick="preset('mes')">Este mes</button><button class="alt" onclick="preset('mesant')">Mes anterior</button><button class="alt" onclick="preset('todo')">Todo</button></div></section>
+<section class="grid">
+<div class="card"><div class="label">Consumo del periodo</div><div class="value" id="kwh">—</div></div>
+<div class="card"><div class="label">Coste de energía</div><div class="value" id="cost">—</div><div class="small">PVPC sin impuestos ni término fijo</div></div>
+<div class="card"><div class="label">Precio medio pagado</div><div class="value" id="avgprice">—</div><div class="small">Coste / consumo con precio disponible</div></div>
+<div class="card"><div class="label">Potencia máxima</div><div class="value" id="maxpower">—</div><div class="small" id="maxpowerat"></div></div>
+<div class="card"><div class="label">Potencia media</div><div class="value" id="avgpower">—</div></div>
+<div class="card"><div class="label">Lecturas guardadas</div><div class="value" id="readings">—</div><div class="small" id="coverage"></div></div>
+<div class="card full"><h2>Consumo y precio PVPC</h2><div class="chart"><canvas id="energyChart"></canvas></div></div>
+<div class="card full"><h2>Coste de energía</h2><div class="chart"><canvas id="costChart"></canvas></div></div>
+<div class="card full"><h2>Potencia</h2><div class="chart"><canvas id="powerChart"></canvas></div><p class="small" id="powerNote"></p></div>
+<div class="card full"><h2>Detalle</h2><p><a id="csvAgg" href="#">Descargar este detalle en CSV</a> · <a id="csvRaw" href="#">Descargar lecturas originales del periodo</a></p><div style="overflow:auto;max-height:520px"><table><thead><tr><th>Periodo</th><th>Consumo kWh</th><th>Coste €</th><th>Precio medio €/kWh</th><th>Potencia media W</th><th>Potencia máx. W</th><th>Lecturas</th></tr></thead><tbody id="rows"></tbody></table></div></div>
+<div class="card full"><h2>Huecos sin datos</h2><p class="small">Periodos de más de 5 minutos sin lecturas (la aplicación estaba parada o el medidor no respondía). El consumo de un hueco se registra todo junto en la primera lectura posterior.</p><div style="overflow:auto"><table><thead><tr><th>Desde</th><th>Hasta</th><th>Duración</th><th>Consumo acumulado kWh</th></tr></thead><tbody id="gaps"></tbody></table></div></div>
+</section></main>
+<script>
+const $=id=>document.getElementById(id);
+const f=(v,n=3)=>v==null?'—':Number(v).toLocaleString('es-ES',{minimumFractionDigits:0,maximumFractionDigits:n});
+const eur=v=>v==null?'—':f(v,2)+' €';
+const iso=d=>d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
+const dur=s=>{s=Math.round(s);const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return (d?d+' d ':'')+(h?h+' h ':'')+m+' min';};
+let info=null;
+function preset(p){const t=new Date();let a=new Date(t),b=new Date(t);
+ if(p==='ayer'){a.setDate(t.getDate()-1);b=new Date(a);}
+ else if(p==='7d')a.setDate(t.getDate()-6);
+ else if(p==='30d')a.setDate(t.getDate()-29);
+ else if(p==='mes')a=new Date(t.getFullYear(),t.getMonth(),1);
+ else if(p==='mesant'){a=new Date(t.getFullYear(),t.getMonth()-1,1);b=new Date(t.getFullYear(),t.getMonth(),0);}
+ else if(p==='todo'&&info&&info.first){a=new Date(info.first.slice(0,10)+'T00:00');b=new Date(info.last.slice(0,10)+'T00:00');}
+ $('desde').value=iso(a);$('hasta').value=iso(b);load();}
+const opts={responsive:true,maintainAspectRatio:false,animation:false,interaction:{mode:'index',intersect:false},plugins:{legend:{labels:{color:'#edf4ff'}}},scales:{x:{ticks:{color:'#9aabc4',maxTicksLimit:14},grid:{color:'#25334b'}},y:{beginAtZero:true,ticks:{color:'#9aabc4'},grid:{color:'#25334b'}}}};
+const energyChart=new Chart($('energyChart'),{data:{labels:[],datasets:[
+ {type:'bar',label:'Consumo (kWh)',data:[],yAxisID:'y',backgroundColor:'#54d6a0'},
+ {type:'line',label:'PVPC medio (€/kWh)',data:[],yAxisID:'yPrice',borderColor:'#ffd479',backgroundColor:'#ffd479',pointRadius:0,tension:.2,spanGaps:true}]},
+ options:{...opts,scales:{x:opts.scales.x,y:{...opts.scales.y,title:{display:true,text:'kWh',color:'#54d6a0'}},yPrice:{position:'right',beginAtZero:true,title:{display:true,text:'€/kWh',color:'#ffd479'},ticks:{color:'#9aabc4'},grid:{drawOnChartArea:false}}}}});
+const costChart=new Chart($('costChart'),{type:'bar',data:{labels:[],datasets:[{label:'Coste (€)',data:[],backgroundColor:'#6da9ff'}]},options:opts});
+const powerChart=new Chart($('powerChart'),{type:'line',data:{labels:[],datasets:[
+ {label:'Potencia media (W)',data:[],borderColor:'#54d6a0',backgroundColor:'#54d6a022',fill:true,pointRadius:0,tension:.2},
+ {label:'Potencia máxima (W)',data:[],borderColor:'#ff8a8a',pointRadius:0,tension:.2,borderWidth:1}]},options:opts});
+async function loadInfo(){const r=await fetch('/api/historico/rango?zona='+encodeURIComponent($('zona').value));info=await r.json();
+ $('available').textContent=info.first?('Datos de esta zona desde '+info.first+' hasta '+info.last+' · '+f(info.count,0)+' lecturas'):'Esta zona todavía no tiene lecturas guardadas';}
+async function load(){const q=new URLSearchParams({zona:$('zona').value,desde:$('desde').value,hasta:$('hasta').value,agrupar:$('agrupar').value});
+ history.replaceState(null,'','/historico?'+q);
+ $('csvAgg').href='/exportar.csv?'+q;const raw=new URLSearchParams(q);raw.delete('agrupar');$('csvRaw').href='/exportar.csv?'+raw;
+ const r=await fetch('/api/historico?'+q);const j=await r.json();if(!r.ok){$('available').innerHTML='<span class="warn">'+(j.error||'Error')+'</span>';return;}
+ const t=j.totals;$('kwh').textContent=f(t.kwh,3)+' kWh';$('cost').textContent=eur(t.cost_eur);$('avgprice').textContent=t.avg_price_eur_kwh==null?'—':f(t.avg_price_eur_kwh,5)+' €/kWh';
+ $('maxpower').textContent=t.max_power==null?'—':f(t.max_power,1)+' W';$('maxpowerat').textContent=t.max_power_at?'el '+t.max_power_at:'';$('avgpower').textContent=t.avg_power==null?'—':f(t.avg_power,1)+' W';
+ $('readings').textContent=f(t.readings,0);$('coverage').textContent=t.readings?('Primera '+t.first+' · última '+t.last+(j.gaps.length?' · '+j.gaps.length+' huecos':'')):'Sin lecturas en este periodo';
+ const lab=j.groups.map(g=>g.label);energyChart.data.labels=lab;energyChart.data.datasets[0].data=j.groups.map(g=>g.kwh);energyChart.data.datasets[1].data=j.groups.map(g=>g.avg_price_eur_kwh);energyChart.update();
+ costChart.data.labels=lab;costChart.data.datasets[0].data=j.groups.map(g=>g.cost_eur);costChart.update();
+ powerChart.data.labels=j.power.map(p=>p.time);powerChart.data.datasets[0].data=j.power.map(p=>p.avg);powerChart.data.datasets[1].data=j.power.map(p=>p.max);powerChart.update();
+ $('powerNote').textContent='Cada punto resume '+dur(j.power_bucket_seconds)+' de lecturas.';
+ $('rows').innerHTML=j.groups.map(g=>'<tr>'+[g.label,f(g.kwh,3),eur(g.cost_eur),g.avg_price_eur_kwh==null?'—':f(g.avg_price_eur_kwh,5),f(g.avg_power,1),f(g.max_power,1),f(g.readings,0)].map(v=>'<td>'+v+'</td>').join('')+'</tr>').join('')||'<tr><td colspan="7">Sin datos</td></tr>';
+ $('gaps').innerHTML=j.gaps.map(g=>'<tr><td>'+g.from+'</td><td>'+g.to+'</td><td>'+dur(g.seconds)+'</td><td>'+f(g.kwh_after,3)+'</td></tr>').join('')||'<tr><td colspan="4">Sin huecos en este periodo</td></tr>';}
+$('zona').onchange=async()=>{await loadInfo();load();};
+(async()=>{const p=new URLSearchParams(location.search);if(p.get('zona'))$('zona').value=p.get('zona');if(p.get('agrupar'))$('agrupar').value=p.get('agrupar');
+ await loadInfo();if(p.get('desde')&&p.get('hasta')){$('desde').value=p.get('desde');$('hasta').value=p.get('hasta');load();}else preset('7d');})();
+</script></body></html>"""
+
+HISTORY_GROUPS = {"hora": (13, "%Y-%m-%d %H"), "dia": (10, "%Y-%m-%d"), "mes": (7, "%Y-%m")}
+GAP_SECONDS = 300
+
+def history_range(args):
+    """Parse zona/desde/hasta/agrupar into local epochs. Raises ValueError with a user-facing message."""
+    zone = args.get("zona", DEFAULT_ZONE)
+    if zone not in ZONES:
+        raise ValueError("Zona desconocida")
+    try:
+        start = datetime.strptime(args.get("desde", ""), "%Y-%m-%d").astimezone()
+        end = (datetime.strptime(args.get("hasta", ""), "%Y-%m-%d") + timedelta(days=1)).astimezone()
+    except ValueError:
+        raise ValueError("Fechas no válidas: usa el formato AAAA-MM-DD")
+    if end <= start:
+        raise ValueError("La fecha final debe ser igual o posterior a la inicial")
+    group = args.get("agrupar", "auto")
+    if group == "auto":
+        days = (end - start).days
+        group = "hora" if days <= 3 else ("dia" if days <= 92 else "mes")
+    if group not in HISTORY_GROUPS:
+        raise ValueError("Agrupación no válida")
+    return zone, start.timestamp(), end.timestamp(), group
+
+def history_groups(c, start, end, group):
+    width = HISTORY_GROUPS[group][0]
+    rows = c.execute(f"""SELECT substr(timestamp,1,{width}) label, COALESCE(SUM(delta_kwh),0) kwh,
+        COALESCE(SUM(energy_cost_eur),0) cost, SUM(CASE WHEN pvpc_eur_mwh IS NOT NULL THEN delta_kwh ELSE 0 END) priced_kwh,
+        AVG(pvpc_eur_mwh) price, AVG(act_power) avg_power, MAX(act_power) max_power, COUNT(*) readings
+        FROM measurements WHERE epoch>=? AND epoch<? GROUP BY label ORDER BY label""", (start, end)).fetchall()
+    out = []
+    for r in rows:
+        # Energy-weighted price when there was consumption; plain hourly average otherwise.
+        price = r["cost"] / r["priced_kwh"] if r["priced_kwh"] else (r["price"] / 1000.0 if r["price"] is not None else None)
+        label = r["label"] + ":00" if group == "hora" else r["label"]
+        out.append({"label": label, "kwh": float(r["kwh"]), "cost_eur": float(r["cost"]), "avg_price_eur_kwh": price,
+                    "avg_power": r["avg_power"], "max_power": r["max_power"], "readings": r["readings"]})
+    return out
+
+@app.route("/historico")
+def historico():
+    return render_template_string(HISTORY, zones=ZONES)
+
+@app.route("/api/historico/rango")
+def api_historico_rango():
+    zone = request.args.get("zona", DEFAULT_ZONE)
+    if zone not in ZONES:
+        return jsonify(error="Zona desconocida"), 400
+    with connect(zone) as c:
+        first, last, count = c.execute("SELECT MIN(timestamp),MAX(timestamp),COUNT(*) FROM measurements").fetchone()
+    return jsonify(zone=zone, first=first, last=last, count=count)
+
+@app.route("/api/historico")
+def api_historico():
+    try:
+        zone, start, end, group = history_range(request.args)
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+    # About 400 points in the power chart whatever the length of the period.
+    bucket = max(POLL_SECONDS, int((end - start) / 400))
+    with connect(zone) as c:
+        c.row_factory = sqlite3.Row
+        groups = history_groups(c, start, end, group)
+        t = c.execute("""SELECT COALESCE(SUM(delta_kwh),0) kwh, COALESCE(SUM(energy_cost_eur),0) cost,
+            SUM(CASE WHEN pvpc_eur_mwh IS NOT NULL THEN delta_kwh ELSE 0 END) priced_kwh, AVG(act_power) avg_power,
+            COUNT(*) readings, MIN(timestamp) first, MAX(timestamp) last
+            FROM measurements WHERE epoch>=? AND epoch<?""", (start, end)).fetchone()
+        peak = c.execute("SELECT act_power,timestamp FROM measurements WHERE epoch>=? AND epoch<? ORDER BY act_power DESC LIMIT 1", (start, end)).fetchone()
+        power = c.execute("""SELECT MIN(timestamp) time, AVG(act_power) avg, MAX(act_power) max FROM measurements
+            WHERE epoch>=? AND epoch<? GROUP BY CAST(epoch/? AS INTEGER) ORDER BY time""", (start, end, bucket)).fetchall()
+        gaps = c.execute("""SELECT prev_ts, timestamp, epoch-prev_epoch secs, delta_kwh FROM (
+              SELECT timestamp, epoch, delta_kwh, LAG(epoch) OVER (ORDER BY epoch) prev_epoch, LAG(timestamp) OVER (ORDER BY epoch) prev_ts
+              FROM measurements WHERE epoch>=? AND epoch<?) WHERE epoch-prev_epoch>? ORDER BY epoch""", (start, end, GAP_SECONDS)).fetchall()
+    short = bucket < 86400
+    return jsonify(zone=zone, group=group, groups=groups, power_bucket_seconds=bucket,
+        totals={"kwh": float(t["kwh"]), "cost_eur": float(t["cost"]),
+                "avg_price_eur_kwh": t["cost"] / t["priced_kwh"] if t["priced_kwh"] else None,
+                "avg_power": t["avg_power"], "readings": t["readings"], "first": t["first"], "last": t["last"],
+                "max_power": peak["act_power"] if peak else None, "max_power_at": peak["timestamp"] if peak else None},
+        power=[{"time": (r["time"][5:16] if short else r["time"][:10]), "avg": r["avg"], "max": r["max"]} for r in power],
+        gaps=[{"from": g["prev_ts"], "to": g["timestamp"], "seconds": g["secs"], "kwh_after": g["delta_kwh"]} for g in gaps])
 
 @app.route("/")
 def home():
@@ -466,12 +616,28 @@ def export_csv():
     zone = request.args.get("zona", DEFAULT_ZONE)
     if zone not in ZONES:
         return "Zona desconocida", 400
-    with connect(zone) as c:
-        rows=c.execute("SELECT timestamp,voltage,current,act_power,aprt_power,pf,freq,total_kwh,returned_kwh,delta_kwh,pvpc_eur_mwh,energy_cost_eur FROM measurements ORDER BY id").fetchall()
+    # Optional period (desde/hasta) and, with agrupar, totals per hour/day/month instead of raw readings.
+    start, end, group, suffix = 0, float("inf"), None, ""
+    if request.args.get("desde") or request.args.get("hasta"):
+        try:
+            zone, start, end, group = history_range(request.args)
+        except ValueError as e:
+            return str(e), 400
+        suffix = f"_{request.args['desde']}_{request.args['hasta']}"
+        if "agrupar" not in request.args:
+            group = None
     out=io.StringIO(); w=csv.writer(out)
-    w.writerow(["fecha_hora","tension_V","corriente_A","potencia_W","potencia_aparente_VA","factor_potencia","frecuencia_Hz","energia_consumida_total_kWh","energia_devuelta_total_kWh","delta_consumo_kWh","PVPC_EUR_MWh","coste_energia_EUR"])
-    w.writerows(rows)
-    return Response("\ufeff"+out.getvalue(),mimetype="text/csv",headers={"Content-Disposition":f"attachment; filename=shelly_pvpc_historico_{zone}.csv"})
+    with connect(zone) as c:
+        if group:
+            c.row_factory = sqlite3.Row
+            w.writerow(["periodo","consumo_kWh","coste_energia_EUR","precio_medio_EUR_kWh","potencia_media_W","potencia_max_W","lecturas"])
+            w.writerows([[g["label"],g["kwh"],g["cost_eur"],g["avg_price_eur_kwh"],g["avg_power"],g["max_power"],g["readings"]] for g in history_groups(c, start, end, group)])
+            suffix += f"_por_{group}"
+        else:
+            rows=c.execute("SELECT timestamp,voltage,current,act_power,aprt_power,pf,freq,total_kwh,returned_kwh,delta_kwh,pvpc_eur_mwh,energy_cost_eur FROM measurements WHERE epoch>=? AND epoch<? ORDER BY id",(start,end)).fetchall()
+            w.writerow(["fecha_hora","tension_V","corriente_A","potencia_W","potencia_aparente_VA","factor_potencia","frecuencia_Hz","energia_consumida_total_kWh","energia_devuelta_total_kWh","delta_consumo_kWh","PVPC_EUR_MWh","coste_energia_EUR"])
+            w.writerows(rows)
+    return Response("\ufeff"+out.getvalue(),mimetype="text/csv",headers={"Content-Disposition":f"attachment; filename=shelly_pvpc_historico_{zone}{suffix}.csv"})
 
 if __name__=="__main__":
     init_db()
